@@ -18,8 +18,8 @@
   "panel.pause": "Pause / resume",
   "panel.random": "Random wallpaper",
   "panel.sound": "Sound",
-  "panel.automute": "Mute while other apps play",
-  "panel.reactive": "Audio-reactive",
+  "panel.automute": "Auto-mute",
+  "panel.reactive": "Reactive",
   "panel.noProps": "This wallpaper has no settings",
   "panel.none": "No wallpaper selected",
   "panel.presetName": "Preset name",
@@ -31,5 +31,6 @@
     "one": "%1 wallpaper",
     "other": "%1 wallpapers"
   },
-  "panel.hint": "Enter: apply · right click: favourite · Esc: close"
+  "panel.hint": "Enter: apply · right click: favourite · Esc: close",
+  "panel.theme": "Theme from wallpaper"
 }

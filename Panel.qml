@@ -543,7 +543,7 @@ Panel {
             text: root.tr("panel.sound")
           }
           PanelSlider {
-            width: Style.space(140)
+            width: Style.space(110)
             anchors.verticalCenter: parent.verticalCenter
             bar: root.bar
             minimum: 0
@@ -572,6 +572,15 @@ Panel {
           Label {
             anchors.verticalCenter: parent.verticalCenter
             text: root.tr("panel.automute")
+          }
+          ToggleSwitch {
+            anchors.verticalCenter: parent.verticalCenter
+            checked: root.config.theme_sync === true
+            onToggled: root.setConfig("theme_sync", root.config.theme_sync !== true)
+          }
+          Label {
+            anchors.verticalCenter: parent.verticalCenter
+            text: root.tr("panel.theme")
           }
         }
       }
