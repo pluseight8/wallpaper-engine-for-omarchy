@@ -1,13 +1,18 @@
 //! omawed — keeps linux-wallpaperengine running the way the session needs it.
 //!
 //! One task owns all state and reacts to events (CLI requests, Hyprland, UPower, inotify,
-//! renderer exit). After every event it compares what should be running with what is,
-//! and fixes the difference. Nothing wakes up on a timer while idle.
+//! renderer exit, playlist deadline). After every event it compares what should be running
+//! with what is, and fixes the difference. Nothing wakes up on a timer while idle.
+//!
+//! Each monitor gets its own renderer process: that is what makes pause, properties and
+//! switching independent per monitor, since the renderer has no runtime control.
 
 mod config;
 mod db;
 mod hypr;
+mod playlist;
 mod project;
+mod theme;
 mod vdf;
 
 use config::Config;
@@ -26,13 +31,17 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::sync::{oneshot, watch};
+use tokio::time::Instant;
 
 const APPID: &str = "431960";
 /// Assignment key meaning "every monitor without its own wallpaper".
 const ALL: &str = "*";
+/// Slug of the generated Omarchy theme.
+const THEME: &str = "omawe-live";
 
 type Res<T> = Result<T, String>;
 type Reply = (String, Value);
+type Props = BTreeMap<String, String>;
 
 enum Event {
     Request(Value, oneshot::Sender<Value>),
@@ -42,6 +51,7 @@ enum Event {
     Exit(u32),
     LibraryChanged,
     ConfigChanged,
+    ThumbsDone,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
@@ -56,11 +66,20 @@ struct Assign {
 struct Proc {
     pid: u32,
     args: Vec<String>,
+    id: String,
     paused: bool,
     ready: bool,
     frame: PathBuf,
-    /// Distinct wallpaper ids shown by this process.
-    ids: Vec<String>,
+}
+
+/// One monitor's renderer.
+#[derive(Default)]
+struct Slot {
+    cur: Option<Proc>,
+    /// Previous renderer, kept on screen until `cur` has drawn its first frame.
+    old: Option<Proc>,
+    /// Arguments that crashed the renderer; not retried until something changes.
+    crashed: Option<Vec<String>>,
 }
 
 struct Dirs {
@@ -100,6 +119,53 @@ fn discharging() -> bool {
     dir.flatten().any(|e| std::fs::read_to_string(e.path().join("status")).is_ok_and(|s| s.trim() == "Discharging"))
 }
 
+/// A project.json value the way `--set-property` takes it.
+fn prop_text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Bool(b) => (*b as u8).to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Check a user-supplied property value against its definition and normalise it.
+fn check_prop(def: &Value, value: &str) -> Res<String> {
+    let kind = def["type"].as_str().unwrap_or_default().to_lowercase();
+    match kind.as_str() {
+        "bool" => match value.to_lowercase().as_str() {
+            "1" | "true" | "on" => Ok("1".into()),
+            "0" | "false" | "off" => Ok("0".into()),
+            _ => Err("нужно true или false".into()),
+        },
+        "slider" => {
+            let n: f64 = value.parse().map_err(|_| "нужно число".to_string())?;
+            let (min, max) = (def["min"].as_f64().unwrap_or(f64::MIN), def["max"].as_f64().unwrap_or(f64::MAX));
+            if !n.is_finite() || max < min {
+                return Err("нужно число".into());
+            }
+            Ok(n.clamp(min, max).to_string())
+        }
+        "color" => {
+            let parts: Vec<f64> = value.split_whitespace().filter_map(|p| p.parse().ok()).collect();
+            match parts.as_slice() {
+                // Always with a decimal point: the renderer reads "1 0 0" as 0–255 integers.
+                [r, g, b] if parts.iter().all(|c| (0.0..=1.0).contains(c)) => Ok(format!("{r:.5} {g:.5} {b:.5}")),
+                _ => Err("нужен цвет как три числа от 0 до 1: «0.5 0.2 1»".into()),
+            }
+        }
+        "combo" => {
+            let options = def["options"].as_array().map(Vec::as_slice).unwrap_or_default();
+            if options.iter().any(|o| prop_text(&o["value"]) == value) {
+                Ok(value.into())
+            } else {
+                Err(format!("допустимые значения: {}", options.iter().map(|o| prop_text(&o["value"])).collect::<Vec<_>>().join(", ")))
+            }
+        }
+        "textinput" => Ok(value.into()),
+        other => Err(format!("свойства типа «{other}» менять нельзя")),
+    }
+}
+
 struct Daemon {
     cfg: Config,
     db: Db,
@@ -108,16 +174,18 @@ struct Daemon {
     status: watch::Sender<String>,
     sources: Vec<PathBuf>,
     assign: BTreeMap<String, Assign>,
+    /// `omawe set` values laid over config.toml.
+    overrides: Props,
     manual_pause: bool,
     on_battery: bool,
     snap: hypr::Snapshot,
-    cur: Option<Proc>,
-    /// Previous renderer, kept on screen until `cur` has drawn its first frame.
-    old: Option<Proc>,
-    /// Arguments that crashed the renderer; not retried until something changes.
-    crashed: Option<Vec<String>>,
+    slots: BTreeMap<String, Slot>,
     error: String,
     spawned: u32,
+    thumbing: bool,
+    /// Next playlist timer / time-of-day deadline.
+    interval_at: Option<Instant>,
+    hours_at: Option<Instant>,
 }
 
 impl Daemon {
@@ -167,6 +235,8 @@ impl Daemon {
                     match parsed {
                         Ok(p) => {
                             self.db.upsert(&id, &dir.to_string_lossy(), meta.mtime(), &p)?;
+                            // The preview may have changed with the project.
+                            let _ = std::fs::remove_file(self.thumb(&id));
                             updated += 1;
                         }
                         Err(e) => eprintln!("skip {}: {e}", dir.display()),
@@ -180,6 +250,93 @@ impl Daemon {
             self.db.remove(id)?;
         }
         Ok((updated, gone.len()))
+    }
+
+    fn thumb(&self, id: &str) -> PathBuf {
+        self.dirs.cache.join("thumbs").join(format!("{id}.webp"))
+    }
+
+    /// Fill in cached thumbnails and start generating the missing ones in the background.
+    fn attach_thumbs(&mut self, list: &mut [Wallpaper]) {
+        let mut jobs = Vec::new();
+        for w in list.iter_mut().filter(|w| !w.preview.is_empty()) {
+            let thumb = self.thumb(&w.id);
+            if thumb.exists() {
+                w.thumb = thumb.to_string_lossy().into_owned();
+            } else {
+                jobs.push((w.preview.clone(), thumb));
+            }
+        }
+        if jobs.is_empty() || self.thumbing {
+            return;
+        }
+        self.thumbing = true;
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            // One low-priority conversion at a time: opening the browser must not spin up every core.
+            for (preview, thumb) in jobs {
+                let tmp = thumb.with_extension("tmp.webp");
+                let done = tokio::process::Command::new("nice")
+                    .args(["-n", "19", "magick"])
+                    .arg(format!("{preview}[0]")) // first frame of an animated preview
+                    .args(["-thumbnail", "480x270^", "-gravity", "center", "-extent", "480x270", "-quality", "80"])
+                    .arg(&tmp)
+                    .stderr(Stdio::null())
+                    .status()
+                    .await;
+                if done.is_ok_and(|s| s.success()) {
+                    let _ = std::fs::rename(&tmp, &thumb);
+                } else {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+            }
+            let _ = tx.send(Event::ThumbsDone);
+        });
+    }
+
+    // ---- properties --------------------------------------------------------
+
+    /// What actually renders for a wallpaper: its folder, property definitions and built-in overrides.
+    /// A Workshop preset is another wallpaper plus overrides.
+    fn base(&self, w: &Wallpaper) -> Option<(String, Value, Props)> {
+        let mut preset = Props::new();
+        let base = if w.kind == "preset" {
+            if let Ok(Value::Object(values)) = serde_json::from_str(&w.preset) {
+                preset = values.iter().map(|(k, v)| (k.clone(), prop_text(v))).collect();
+            }
+            self.db.get(&w.dependency).ok()??
+        } else {
+            w.clone()
+        };
+        let defs = serde_json::from_str(&base.props).unwrap_or(Value::Null);
+        Some((base.dir, defs, preset))
+    }
+
+    /// Property list for the editor: definition plus the value in effect on `monitor`.
+    fn props_json(&self, w: &Wallpaper, monitor: &str) -> Res<Vec<Value>> {
+        let (_, defs, preset) = self.base(w).ok_or("базовые обои пресета не найдены")?;
+        let user = self.db.props(&w.id, monitor);
+        let mut out: Vec<(f64, Value)> = Vec::new();
+        for (key, def) in defs.as_object().into_iter().flatten().filter(|(_, d)| d.is_object()) {
+            let default = prop_text(&def["value"]);
+            let value = user.get(key).or(preset.get(key)).cloned().unwrap_or_else(|| default.clone());
+            out.push((
+                def["order"].as_f64().unwrap_or(0.0),
+                json!({
+                    "key": key,
+                    // Untyped entries are labels and separators.
+                    "type": def["type"].as_str().unwrap_or("text").to_lowercase(),
+                    "text": def["text"].as_str().unwrap_or(key),
+                    "value": value,
+                    "default": default,
+                    "changed": user.contains_key(key),
+                    "min": def["min"], "max": def["max"], "step": def["step"],
+                    "options": def["options"],
+                }),
+            ));
+        }
+        out.sort_by(|a, b| a.0.total_cmp(&b.0));
+        Ok(out.into_iter().map(|(_, v)| v).collect())
     }
 
     // ---- policy ------------------------------------------------------------
@@ -208,7 +365,7 @@ impl Daemon {
         if self.on_battery { self.cfg.fps_battery } else { self.cfg.fps_ac }
     }
 
-    /// Why the renderer should not exist at all right now.
+    /// Why no renderer should exist at all right now.
     fn stop_reason(&self) -> Option<&'static str> {
         if self.cfg.stop_on_game && self.snap.game {
             Some("game")
@@ -219,10 +376,10 @@ impl Daemon {
         }
     }
 
-    fn pause_reason(&self) -> Option<&'static str> {
+    fn pause_reason(&self, monitor: &str) -> Option<&'static str> {
         if self.manual_pause {
             Some("manual")
-        } else if self.cfg.pause_fullscreen && self.snap.covered {
+        } else if self.cfg.pause_fullscreen && self.snap.covered.contains(monitor) {
             Some("fullscreen")
         } else if self.on_battery && self.cfg.battery == "pause" {
             Some("battery")
@@ -231,62 +388,50 @@ impl Daemon {
         }
     }
 
-    fn renderer_args(&self) -> Option<(Vec<String>, Vec<String>)> {
-        let shown = self.shown();
-        if shown.is_empty() || self.stop_reason().is_some() {
-            return None;
+    /// Renderer arguments and wallpaper id wanted on each monitor.
+    fn wanted(&self) -> BTreeMap<String, (Vec<String>, String)> {
+        let mut out = BTreeMap::new();
+        if self.stop_reason().is_some() {
+            return out;
         }
         let c = &self.cfg;
-        let mut args = vec!["--fps".to_string(), self.fps().to_string()];
-        if c.silent {
-            args.push("--silent".into());
-        } else {
-            args.extend(["--volume".into(), c.volume.to_string()]);
-        }
-        for (off, flag) in [
-            (!c.automute, "--noautomute"),
-            (!c.audio_processing, "--no-audio-processing"),
-            (!c.pause_fullscreen, "--no-fullscreen-pause"),
-        ] {
-            if off {
-                args.push(flag.into());
+        for (i, (mon, a, w)) in self.shown().into_iter().enumerate() {
+            let Some((dir, _, mut props)) = self.base(&w) else { continue };
+            props.extend(self.db.props(&w.id, &mon));
+            let mut args = vec!["--fps".to_string(), self.fps().to_string()];
+            // One audible renderer: the same wallpaper on two monitors must not play twice.
+            if c.silent || i > 0 {
+                args.push("--silent".into());
+            } else {
+                args.extend(["--volume".into(), c.volume.to_string()]);
             }
-        }
-        let mut ids = BTreeSet::new();
-        for (mon, a, w) in shown {
-            // A preset is another wallpaper plus property overrides.
-            let mut dir = w.dir.clone();
-            if w.kind == "preset" {
-                match self.db.get(&w.dependency) {
-                    Ok(Some(base)) => dir = base.dir,
-                    _ => continue,
-                }
-                if let Ok(Value::Object(props)) = serde_json::from_str(&w.preset) {
-                    for (k, v) in props {
-                        let v = match v {
-                            Value::String(s) => s,
-                            Value::Bool(b) => (b as u8).to_string(),
-                            other => other.to_string(),
-                        };
-                        args.extend(["--set-property".into(), format!("{k}={v}")]);
-                    }
+            for (off, flag) in [
+                (!c.automute, "--noautomute"),
+                (!c.audio_processing, "--no-audio-processing"),
+                (!c.pause_fullscreen, "--no-fullscreen-pause"),
+            ] {
+                if off {
+                    args.push(flag.into());
                 }
             }
-            args.extend(["--screen-root".into(), mon, "--bg".into(), dir]);
+            for (k, v) in props {
+                args.extend(["--set-property".into(), format!("{k}={v}")]);
+            }
+            args.extend(["--screen-root".into(), mon.clone(), "--bg".into(), dir]);
             args.extend(["--scaling".into(), a.scaling.unwrap_or_else(|| c.scaling.clone())]);
             args.extend(["--clamp".into(), a.clamp.unwrap_or_else(|| c.clamp.clone())]);
-            ids.insert(w.id);
+            out.insert(mon, (args, w.id));
         }
-        (!ids.is_empty()).then(|| (args, ids.into_iter().collect()))
+        out
     }
 
     // ---- renderer ----------------------------------------------------------
 
-    fn twin(&self, ids: &[String]) -> PathBuf {
-        self.dirs.cache.join("twins").join(format!("{}.png", ids.join("+")))
+    fn twin(&self, id: &str) -> PathBuf {
+        self.dirs.cache.join("twins").join(format!("{id}.png"))
     }
 
-    fn spawn(&mut self, args: Vec<String>, ids: Vec<String>) -> Res<Proc> {
+    fn spawn(&mut self, args: Vec<String>, id: String) -> Res<Proc> {
         self.spawned += 1;
         let frame = self.dirs.cache.join("twins").join(format!(".frame-{}.png", self.spawned));
         let _ = std::fs::remove_file(&frame);
@@ -321,115 +466,237 @@ impl Daemon {
             }
             let _ = tx.send(Event::Frame(pid, false));
         });
-        Ok(Proc { pid, args, paused: false, ready: false, frame, ids })
+        Ok(Proc { pid, args, id, paused: false, ready: false, frame })
     }
 
-    /// Make the running renderer match the policy.
+    /// Make the running renderers match the policy.
     fn reconcile(&mut self) {
-        let Some((args, ids)) = self.renderer_args() else {
-            // The still frame under the renderer stays as Omarchy's background.
-            terminate(&mut self.cur);
-            terminate(&mut self.old);
-            return;
-        };
-        if self.cur.as_ref().is_none_or(|c| c.args != args) && self.crashed.as_ref() != Some(&args) {
-            match self.spawn(args, ids) {
-                Ok(new) => {
-                    self.error.clear();
-                    // Swap in progress: drop the unfinished renderer, keep the visible one.
-                    let mut prev = self.cur.replace(new);
-                    if self.old.is_some() {
-                        terminate(&mut prev);
-                    } else {
-                        self.old = prev;
+        let mut wanted = self.wanted();
+        let monitors: BTreeSet<String> = self.slots.keys().chain(wanted.keys()).cloned().collect();
+        for mon in monitors {
+            let mut slot = self.slots.remove(&mon).unwrap_or_default();
+            let Some((args, id)) = wanted.remove(&mon) else {
+                // The still frame under the renderer stays as Omarchy's background.
+                terminate(&mut slot.cur);
+                terminate(&mut slot.old);
+                continue;
+            };
+            if slot.cur.as_ref().is_none_or(|c| c.args != args) && slot.crashed.as_ref() != Some(&args) {
+                match self.spawn(args, id) {
+                    Ok(new) => {
+                        self.error.clear();
+                        // Swap in progress: drop the unfinished renderer, keep the visible one.
+                        let mut prev = slot.cur.replace(new);
+                        if slot.old.is_some() {
+                            terminate(&mut prev);
+                        } else {
+                            slot.old = prev;
+                        }
                     }
-                }
-                Err(e) => {
-                    self.error = e;
-                    return;
+                    Err(e) => self.error = e,
                 }
             }
-        }
-        let want_paused = self.pause_reason().is_some();
-        if let Some(c) = self.cur.as_mut().filter(|c| c.ready && c.paused != want_paused) {
-            signal_group(c.pid, if want_paused { libc::SIGSTOP } else { libc::SIGCONT });
-            c.paused = want_paused;
+            let want_paused = self.pause_reason(&mon).is_some();
+            if let Some(c) = slot.cur.as_mut().filter(|c| c.ready && c.paused != want_paused) {
+                signal_group(c.pid, if want_paused { libc::SIGSTOP } else { libc::SIGCONT });
+                c.paused = want_paused;
+            }
+            self.slots.insert(mon, slot);
         }
     }
 
+    /// Omarchy has one background for all monitors: use the first monitor's still.
     fn sync_omarchy_bg(&self) {
-        let Some(c) = &self.cur else { return };
-        let twin = self.twin(&c.ids);
+        let Some((_, _, w)) = self.shown().into_iter().next() else { return };
+        let twin = self.twin(&w.id);
         if self.cfg.sync_omarchy_bg && twin.exists() {
             run("omarchy-theme-bg-set", &[&twin.to_string_lossy()]);
         }
     }
 
+    /// Build the "omawe-live" theme from the first monitor's still and switch to it.
+    /// Returns false when nothing was started, so the caller still sets the background itself.
+    fn sync_theme(&mut self) -> bool {
+        let Some((_, _, w)) = self.shown().into_iter().next() else { return false };
+        let twin = self.twin(&w.id);
+        // Once per wallpaper: a restart for a pause, a property or an FPS change must not re-theme the desktop.
+        if !self.cfg.theme_sync || !twin.exists() || self.db.state("themed").as_deref() == Some(&w.id) {
+            return false;
+        }
+        self.db.set_state("themed", &w.id);
+        // Remember the user's own theme so turning the feature off can put it back.
+        let current = std::fs::read_to_string(xdg("XDG_STATE_HOME", ".local/state").join("omarchy/current/theme.name"));
+        match current.as_deref().map(str::trim) {
+            Ok(name) if !name.is_empty() && name != THEME => self.db.set_state("theme_before", name),
+            _ => {}
+        }
+        let dir = xdg("XDG_CONFIG_HOME", ".config").join("omarchy/themes").join(THEME);
+        let id = w.id;
+        tokio::spawn(async move {
+            let histogram = tokio::process::Command::new("magick")
+                .arg(&twin)
+                .args(["-resize", "96x96", "-colors", "8", "-format", "%c", "histogram:info:-"])
+                .output()
+                .await;
+            let Ok(histogram) = histogram else { return };
+            let Some(colors) = theme::colors_toml(&theme::parse_histogram(&String::from_utf8_lossy(&histogram.stdout))) else { return };
+            // The theme carries the still as its only background, so applying it also sets the right one.
+            let backgrounds = dir.join("backgrounds");
+            let _ = std::fs::remove_dir_all(&backgrounds);
+            let written = std::fs::create_dir_all(&backgrounds)
+                .and_then(|_| std::fs::copy(&twin, backgrounds.join(format!("{id}.png"))))
+                .and_then(|_| std::fs::write(dir.join("colors.toml"), colors));
+            match written {
+                Ok(()) => run("omarchy-theme-set", &[THEME]),
+                Err(e) => eprintln!("theme: {e}"),
+            }
+        });
+        true
+    }
+
+    /// Theme sync was turned off: give back the theme the user had before it.
+    fn restore_theme(&mut self) {
+        if self.cfg.theme_sync {
+            return;
+        }
+        if let Some(before) = self.db.state("theme_before").filter(|t| !t.is_empty()) {
+            run("omarchy-theme-set", &[&before]);
+        }
+        self.db.set_state("theme_before", "");
+        self.db.set_state("themed", "");
+    }
+
     fn on_frame(&mut self, pid: u32, drawn: bool) {
-        let Some(c) = self.cur.as_mut().filter(|c| c.pid == pid) else { return };
+        let Some(slot) = self.slots.values_mut().find(|s| s.cur.as_ref().is_some_and(|c| c.pid == pid)) else { return };
+        terminate(&mut slot.old);
+        let Some(c) = slot.cur.as_mut() else { return };
         c.ready = true;
-        let (frame, ids) = (c.frame.clone(), c.ids.clone());
-        terminate(&mut self.old);
+        let (frame, id) = (c.frame.clone(), c.id.clone());
         if drawn {
-            let _ = std::fs::rename(frame, self.twin(&ids));
-            self.sync_omarchy_bg();
-            if let [id] = ids.as_slice() {
-                self.db.set_compat(id, "ok");
+            let _ = std::fs::rename(frame, self.twin(&id));
+            self.db.set_compat(&id, "ok");
+            if !self.sync_theme() {
+                self.sync_omarchy_bg();
             }
         }
     }
 
     fn on_exit(&mut self, pid: u32) {
-        if self.old.as_ref().is_some_and(|o| o.pid == pid) {
-            self.old = None;
-        }
-        let Some(dead) = self.cur.take_if(|c| c.pid == pid) else { return };
-        let _ = std::fs::remove_file(&dead.frame);
-        // A renderer that died while stopped was most likely dropped by the compositor; just start again.
-        if !dead.paused {
-            if let ([id], false) = (dead.ids.as_slice(), dead.ready) {
-                self.db.set_compat(id, "crash");
+        for slot in self.slots.values_mut() {
+            if slot.old.as_ref().is_some_and(|o| o.pid == pid) {
+                slot.old = None;
             }
-            self.error = "рендерер завершился с ошибкой".into();
-            self.crashed = Some(dead.args);
-            if self.cfg.notify {
-                run("omarchy-notification-send", &["Wallpaper Engine: обои не запустились", "-t", "4000"]);
+            let Some(dead) = slot.cur.take_if(|c| c.pid == pid) else { continue };
+            let _ = std::fs::remove_file(&dead.frame);
+            // A renderer that died while stopped was most likely dropped by the compositor; just start again.
+            if !dead.paused {
+                if !dead.ready {
+                    self.db.set_compat(&dead.id, "crash");
+                }
+                self.error = "рендерер завершился с ошибкой".into();
+                slot.crashed = Some(dead.args);
+                if self.cfg.notify {
+                    run("omarchy-notification-send", &["Wallpaper Engine: обои не запустились", "-t", "4000"]);
+                }
+            }
+            // The previous renderer is still on screen: keep it.
+            slot.cur = slot.old.take();
+        }
+    }
+
+    fn retry_crashed(&mut self) {
+        for slot in self.slots.values_mut() {
+            slot.crashed = None;
+        }
+    }
+
+    // ---- playlist ----------------------------------------------------------
+
+    fn playlist_filter(&self) -> Value {
+        json!(self.cfg.playlist.filter)
+    }
+
+    /// Apply the time-of-day entry if it is not already showing, and arm both deadlines.
+    fn schedule(&mut self) {
+        let p = self.cfg.playlist.clone();
+        self.interval_at = (p.every > 0).then(|| Instant::now() + Duration::from_secs(p.every * 60));
+        self.hours_at = None;
+        if let Some((target, wait)) = playlist::due(&p.hours, playlist::local_seconds()) {
+            // shortcut: sleeps do not advance while the machine is suspended, so the wait is capped
+            // at 10 min to stay close to wall-clock time; replace with a CLOCK_REALTIME timer if that matters.
+            self.hours_at = Some(Instant::now() + Duration::from_secs(u64::from(wait).min(600) + 1));
+            match self.db.find(target) {
+                Ok(w) if self.assign.get(ALL).is_none_or(|a| a.id != w.id) => {
+                    if let Err(e) = self.apply(&w, &json!({})) {
+                        eprintln!("playlist: {e}");
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("playlist.hours: {e}"),
             }
         }
-        // The previous renderer is still on screen: keep it.
-        self.cur = self.old.take();
+    }
+
+    fn on_tick(&mut self) {
+        let now = Instant::now();
+        let interval_due = self.interval_at.is_some_and(|t| t <= now);
+        // Nobody is watching a paused or stopped wallpaper; keep it until it plays again.
+        let playing = self.slots.values().any(|s| s.cur.as_ref().is_some_and(|c| !c.paused));
+        if interval_due && playing && self.cfg.playlist.hours.is_empty() {
+            let cmd = if self.cfg.playlist.random { "random" } else { "next" };
+            if let Err(e) = self.step(cmd, &self.playlist_filter()) {
+                eprintln!("playlist: {e}");
+            }
+        }
+        let keep = self.interval_at.filter(|_| !interval_due);
+        self.schedule();
+        if let Some(t) = keep {
+            self.interval_at = Some(t);
+        }
     }
 
     // ---- requests ----------------------------------------------------------
 
     fn save(&self) {
         self.db.set_state("assign", &serde_json::to_string(&self.assign).unwrap_or_default());
+        self.db.set_state("overrides", &serde_json::to_string(&self.overrides).unwrap_or_default());
         self.db.set_state("manual_pause", if self.manual_pause { "1" } else { "0" });
     }
 
     fn status_json(&self) -> Value {
         let shown = self.shown();
-        let state = match (&self.cur, shown.is_empty()) {
-            (_, true) => "off",
-            (Some(c), _) if c.paused => "paused",
-            (Some(_), _) => "running",
-            (None, _) => "stopped",
+        let stop = self.stop_reason().or((!self.error.is_empty()).then_some("error"));
+        let mut monitors = BTreeMap::new();
+        for (mon, _, w) in &shown {
+            let cur = self.slots.get(mon).and_then(|s| s.cur.as_ref());
+            let (state, reason) = match cur {
+                Some(c) if c.paused => ("paused", self.pause_reason(mon)),
+                Some(_) => ("running", None),
+                None => ("stopped", stop),
+            };
+            monitors.insert(mon.clone(), json!({"id": w.id, "title": w.title, "state": state, "reason": reason, "pid": cur.map(|c| c.pid)}));
+        }
+        // The session is "running" if anything animates, "paused" if everything alive is stopped.
+        let has = |state: &str| monitors.values().any(|m| m["state"] == state);
+        let state = match () {
+            _ if shown.is_empty() => "off",
+            _ if has("running") => "running",
+            _ if has("paused") => "paused",
+            _ => "stopped",
         };
-        let reason = match state {
-            "paused" => self.pause_reason(),
-            "stopped" => self.stop_reason().or((!self.error.is_empty()).then_some("error")),
-            _ => None,
-        };
+        let first = monitors.values().find(|m| m["state"] == state).or(monitors.values().next());
         json!({
             "state": state,
-            "reason": reason,
+            "reason": first.map(|m| m["reason"].clone()),
             "error": self.error,
-            "title": shown.first().map(|(_, _, w)| w.title.as_str()),
-            "id": shown.first().map(|(_, _, w)| w.id.as_str()),
-            "pid": self.cur.as_ref().map(|c| c.pid),
+            "title": first.map(|m| m["title"].clone()),
+            "id": first.map(|m| m["id"].clone()),
+            "pid": first.map(|m| m["pid"].clone()),
             "fps": self.fps(),
             "on_battery": self.on_battery,
-            "monitors": shown.iter().map(|(m, _, w)| (m.clone(), json!({"id": w.id, "title": w.title}))).collect::<BTreeMap<_, _>>(),
+            "silent": self.cfg.silent,
+            "volume": self.cfg.volume,
+            "monitors": monitors,
         })
     }
 
@@ -437,7 +704,7 @@ impl Daemon {
         if w.compat == "unsupported" {
             return Err(format!("«{}»: обои типа application в linux-wallpaperengine не работают", w.title));
         }
-        if w.kind == "preset" && self.db.get(&w.dependency)?.is_none() {
+        if self.base(w).is_none() {
             return Err(format!("«{}» — пресет, сначала подпишитесь на базовые обои {}", w.title, w.dependency));
         }
         let opt = |k: &str| opts.get(k).and_then(Value::as_str).map(String::from);
@@ -449,7 +716,7 @@ impl Daemon {
                 self.assign.insert(ALL.into(), a)
             }
         };
-        self.crashed = None;
+        self.retry_crashed();
         self.save();
         Ok((w.title.clone(), json!(w)))
     }
@@ -471,13 +738,44 @@ impl Daemon {
             (_, Some(p)) => (p + 1) % n,
             (_, None) => 0,
         };
-        self.apply(&list[i].clone(), opts)
+        // Only the monitor travels on: list filters are not apply options.
+        self.apply(&list[i].clone(), &json!({"monitor": opts.get("monitor")}))
+    }
+
+    /// Store a setting override and reload; a value the config rejects is not kept.
+    fn set(&mut self, key: &str, value: Option<&str>) -> Res<()> {
+        if !config::known_key(key) {
+            return Err(format!("неизвестная настройка: {key}"));
+        }
+        let before = self.overrides.clone();
+        match value {
+            Some(v) => self.overrides.insert(key.into(), v.into()),
+            None => self.overrides.remove(key),
+        };
+        match config::load(&self.dirs.config.join("config.toml"), &self.overrides) {
+            Ok(cfg) => {
+                self.cfg = cfg;
+                self.retry_crashed();
+                self.schedule();
+                self.save();
+                self.restore_theme();
+                if !self.sync_theme() {
+                    self.sync_omarchy_bg();
+                }
+                Ok(())
+            }
+            Err(e) => {
+                self.overrides = before;
+                Err(e)
+            }
+        }
     }
 
     fn handle(&mut self, req: &Value) -> Res<Reply> {
         let opts = req.get("opts").cloned().unwrap_or(json!({}));
-        let arg = req.pointer("/args/0").and_then(Value::as_str);
-        let need = |what: &str| arg.ok_or_else(|| format!("нужен аргумент: {what}"));
+        let arg = |i: usize| req.pointer(&format!("/args/{i}")).and_then(Value::as_str);
+        let need = |i: usize, what: &str| arg(i).ok_or_else(|| format!("нужен аргумент: {what}"));
+        let monitor = opts.get("monitor").and_then(Value::as_str).unwrap_or(ALL).to_string();
         match req.get("cmd").and_then(Value::as_str).unwrap_or_default() {
             "status" => {
                 let s = self.status_json();
@@ -486,7 +784,10 @@ impl Daemon {
                 Ok((format!("{}{reason}: {title}", s["state"].as_str().unwrap_or_default()), s))
             }
             "list" => {
-                let list = self.db.list(&opts)?;
+                let mut list = self.db.list(&opts)?;
+                if opts.get("thumbs").is_some() {
+                    self.attach_thumbs(&mut list);
+                }
                 let text = list
                     .iter()
                     .map(|w| format!("{}\t{}\t{}\t{}{}", w.id, w.kind, w.title, w.compat, if w.fav { "\t★" } else { "" }))
@@ -495,7 +796,7 @@ impl Daemon {
                 Ok((text, json!(list)))
             }
             "apply" => {
-                let w = self.db.find(need("id или название")?)?;
+                let w = self.db.find(need(0, "id или название")?)?;
                 self.apply(&w, &opts)
             }
             cmd @ ("next" | "prev" | "random") => self.step(cmd, &opts),
@@ -513,14 +814,73 @@ impl Daemon {
                     "resume" => false,
                     _ => !self.manual_pause,
                 };
-                self.crashed = None;
+                self.retry_crashed();
                 self.save();
                 Ok((if self.manual_pause { "пауза" } else { "воспроизведение" }.into(), json!(self.manual_pause)))
             }
             "fav" => {
-                let w = self.db.find(need("id или название")?)?;
+                let w = self.db.find(need(0, "id или название")?)?;
                 let fav = self.db.toggle_fav(&w.id)?;
                 Ok((format!("{}{}", if fav { "★ " } else { "" }, w.title), json!(fav)))
+            }
+            "props" => {
+                let w = self.db.find(need(0, "id или название")?)?;
+                let props = self.props_json(&w, &monitor)?;
+                let text = props
+                    .iter()
+                    .filter(|p| !matches!(p["type"].as_str(), Some("text" | "group")))
+                    .map(|p| format!("{}\t{}\t{}", p["key"].as_str().unwrap_or_default(), p["type"].as_str().unwrap_or_default(), p["value"].as_str().unwrap_or_default()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Ok((text, json!({"id": w.id, "title": w.title, "props": props, "presets": self.db.presets(&w.id)?})))
+            }
+            // prop <wallpaper> <key> [value]; without a value the property goes back to its default.
+            "prop" => {
+                let w = self.db.find(need(0, "id или название")?)?;
+                let key = need(1, "ключ свойства")?;
+                let (_, defs, _) = self.base(&w).ok_or("базовые обои пресета не найдены")?;
+                let def = defs.get(key).ok_or_else(|| format!("у «{}» нет свойства {key}", w.title))?;
+                let value = arg(2).map(|v| check_prop(def, v)).transpose().map_err(|e| format!("{key}: {e}"))?;
+                self.db.set_prop(&w.id, &monitor, key, value.as_deref())?;
+                self.retry_crashed();
+                Ok((String::new(), json!(value)))
+            }
+            // preset save|load|rm <wallpaper> <name>, preset reset <wallpaper>
+            "preset" => {
+                let action = need(0, "save, load, rm или reset")?;
+                let w = self.db.find(need(1, "id или название")?)?;
+                match action {
+                    "reset" => self.db.clear_props(&w.id, &monitor)?,
+                    "save" => self.db.save_preset(&w.id, need(2, "имя пресета")?, &self.db.props(&w.id, &monitor))?,
+                    "rm" => self.db.remove_preset(&w.id, need(2, "имя пресета")?)?,
+                    "load" => {
+                        let values = self.db.preset(&w.id, need(2, "имя пресета")?)?;
+                        self.db.clear_props(&w.id, &monitor)?;
+                        for (k, v) in values {
+                            self.db.set_prop(&w.id, &monitor, &k, Some(&v))?;
+                        }
+                    }
+                    other => return Err(format!("неизвестное действие: {other}")),
+                }
+                self.retry_crashed();
+                Ok((String::new(), json!(self.db.presets(&w.id)?)))
+            }
+            "set" => {
+                self.set(need(0, "настройка")?, Some(need(1, "значение")?))?;
+                Ok((String::new(), json!(self.cfg)))
+            }
+            "unset" => {
+                self.set(need(0, "настройка")?, None)?;
+                Ok((String::new(), json!(self.cfg)))
+            }
+            "mute" => {
+                let silent = (!self.cfg.silent).to_string();
+                self.set("silent", Some(&silent))?;
+                Ok((if self.cfg.silent { "звук выключен" } else { "звук включён" }.into(), json!(self.cfg.silent)))
+            }
+            "volume" => {
+                self.set("volume", Some(need(0, "громкость 0–100")?))?;
+                Ok((String::new(), json!(self.cfg.volume)))
             }
             "rescan" => {
                 self.sources = self.find_sources();
@@ -532,16 +892,19 @@ impl Daemon {
                 self.sync_omarchy_bg();
                 Ok((String::new(), Value::Null))
             }
-            "config" => Ok((format!("{:#?}", self.cfg), Value::Null)),
+            "config" => Ok((toml::to_string(&self.cfg).unwrap_or_default(), json!({"config": self.cfg, "overrides": self.overrides}))),
             other => Err(format!("неизвестная команда: {other}")),
         }
     }
 
     fn reload_config(&mut self) {
-        match config::load(&self.dirs.config.join("config.toml")) {
+        match config::load(&self.dirs.config.join("config.toml"), &self.overrides) {
             Ok(cfg) => {
-                self.crashed = None;
+                self.retry_crashed();
                 self.cfg = cfg;
+                self.schedule();
+                self.restore_theme();
+                self.sync_theme();
             }
             // Keep the working settings; a half-saved file must not reset them.
             Err(e) => eprintln!("config.toml ignored: {e}"),
@@ -550,6 +913,10 @@ impl Daemon {
 
     async fn refresh_snapshot(&mut self) {
         if let Some(snap) = hypr::snapshot(self.cfg.pause_maximized).await {
+            // A renderer started while a monitor was still coming up may have died; try again on hotplug.
+            if snap.monitors != self.snap.monitors {
+                self.retry_crashed();
+            }
             self.snap = snap;
         }
     }
@@ -645,7 +1012,7 @@ async fn main() -> Res<()> {
         socket: xdg("XDG_RUNTIME_DIR", ".cache").join("omawe.sock"),
     };
     let data = xdg("XDG_DATA_HOME", ".local/share").join("omawe");
-    for dir in [&dirs.config, &data, &dirs.cache.join("twins")] {
+    for dir in [&dirs.config, &data, &dirs.cache.join("twins"), &dirs.cache.join("thumbs")] {
         std::fs::create_dir_all(dir).map_err(io)?;
     }
 
@@ -659,12 +1026,14 @@ async fn main() -> Res<()> {
     let (hypr_tx, mut hypr_rx) = mpsc::channel(1);
     let (status, status_rx) = watch::channel(String::new());
     let db = Db::open(&data.join("library.db"))?;
+    let overrides: Props = db.state("overrides").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
     let mut d = Daemon {
-        cfg: config::load(&dirs.config.join("config.toml")).unwrap_or_else(|e| {
+        cfg: config::load(&dirs.config.join("config.toml"), &overrides).unwrap_or_else(|e| {
             eprintln!("config.toml ignored: {e}");
             Config::default()
         }),
         assign: db.state("assign").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
+        overrides,
         manual_pause: db.state("manual_pause").as_deref() == Some("1"),
         db,
         dirs,
@@ -673,15 +1042,23 @@ async fn main() -> Res<()> {
         sources: Vec::new(),
         on_battery: discharging(),
         snap: Default::default(),
-        cur: None,
-        old: None,
-        crashed: None,
+        slots: BTreeMap::new(),
         error: String::new(),
         spawned: 0,
+        thumbing: false,
+        interval_at: None,
+        hours_at: None,
     };
     d.sources = d.find_sources();
     d.rescan()?;
     d.refresh_snapshot().await;
+    if d.cfg.playlist.on_login {
+        let cmd = if d.cfg.playlist.random { "random" } else { "next" };
+        if let Err(e) = d.step(cmd, &d.playlist_filter()) {
+            eprintln!("playlist: {e}");
+        }
+    }
+    d.schedule();
 
     tokio::spawn(hypr::listen(hypr_tx));
     tokio::spawn(watch_battery(tx.clone()));
@@ -702,6 +1079,8 @@ async fn main() -> Res<()> {
         let now = d.status_json().to_string();
         d.status.send_if_modified(|s| if *s != now { *s = now; true } else { false });
 
+        // Earliest playlist deadline, if a playlist is configured at all.
+        let deadline = [d.interval_at, d.hours_at].into_iter().flatten().min();
         tokio::select! {
             Some(ev) = rx.recv() => match ev {
                 Event::Request(req, reply) => {
@@ -723,15 +1102,39 @@ async fn main() -> Res<()> {
                     d.reload_config();
                     d.refresh_snapshot().await;
                 }
+                Event::ThumbsDone => d.thumbing = false,
             },
             Some(()) = hypr_rx.recv() => d.refresh_snapshot().await,
+            _ = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now)), if deadline.is_some() => d.on_tick(),
             _ = term.recv() => break,
             _ = int.recv() => break,
         }
     }
 
-    terminate(&mut d.cur);
-    terminate(&mut d.old);
+    for slot in d.slots.values_mut() {
+        terminate(&mut slot.cur);
+        terminate(&mut slot.old);
+    }
     let _ = std::fs::remove_file(&d.dirs.socket);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn property_values_are_checked_and_normalised() {
+        let color = json!({"type": "color"});
+        assert_eq!(check_prop(&color, "1 0 0.5").unwrap(), "1.00000 0.00000 0.50000");
+        assert!(check_prop(&color, "255 0 0").is_err());
+        assert!(check_prop(&color, "red").is_err());
+        assert_eq!(check_prop(&json!({"type": "Bool"}), "true").unwrap(), "1");
+        assert_eq!(check_prop(&json!({"type": "slider", "min": 0, "max": 2}), "9").unwrap(), "2");
+        assert!(check_prop(&json!({"type": "slider"}), "NaN").is_err());
+        let combo = json!({"type": "combo", "options": [{"label": "A", "value": "1"}, {"label": "B", "value": 2}]});
+        assert_eq!(check_prop(&combo, "2").unwrap(), "2");
+        assert!(check_prop(&combo, "3").is_err());
+        assert!(check_prop(&json!({"type": "file"}), "/etc/passwd").is_err());
+    }
 }

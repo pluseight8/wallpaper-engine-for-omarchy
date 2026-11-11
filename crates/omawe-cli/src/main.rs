@@ -15,12 +15,18 @@ const USAGE: &str = "omawe — Wallpaper Engine для Omarchy
   omawe stop [--monitor M]           убрать живые обои, оставить статичный кадр
   omawe list [--type scene|video|web|preset] [--tag T] [--rating R] [--search S] [--fav] [--sort recent]
   omawe fav <id|название>            добавить в избранное или убрать
+  omawe props <id|название> [--monitor M]            свойства обоев и их значения
+  omawe prop <id|название> <ключ> [значение]         изменить свойство; без значения — вернуть по умолчанию
+  omawe preset save|load|rm <id|название> <имя>      пресеты свойств
+  omawe preset reset <id|название>                   сбросить все свойства
+  omawe volume <0-100> | mute                        звук
+  omawe set <настройка> <значение> | unset <настройка>   например: set fps_ac 30, set playlist.every 20
   omawe status | watch | rescan | refresh | config
 
   --json                             ответ демона как есть";
 
 /// Flags that never take a value.
-const SWITCHES: [&str; 2] = ["json", "fav"];
+const SWITCHES: [&str; 3] = ["json", "fav", "thumbs"];
 
 fn main() {
     let mut argv = std::env::args().skip(1);

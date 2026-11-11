@@ -22,6 +22,39 @@ BarWidget {
     if (root.bar) root.bar.run(command)
   }
 
+  // ---- Browser panel. The bar routes summon/hide/toggle through open/close/opened
+  //      on this widget, and identifies the popout by it, so both are forwarded.
+  readonly property bool opened: panelLoader.item ? panelLoader.item.opened === true : false
+  readonly property bool popoutSwitchClosing: panelLoader.item ? panelLoader.item.popoutSwitchClosing === true : false
+  function open() { if (panelLoader.item) panelLoader.item.open() }
+  function close() { if (panelLoader.item) panelLoader.item.close() }
+  function closeForPopoutSwitch() { if (panelLoader.item) panelLoader.item.closeForPopoutSwitch() }
+
+  function injectPanel() {
+    var target = panelLoader.item
+    if (!target) return
+    target.bar = root.bar
+    target.settings = root.settings
+    target.anchorItem = button
+    target.hostWidget = root
+    target.strings = strings
+    target.status = root.status
+  }
+
+  onBarChanged: injectPanel()
+  onSettingsChanged: injectPanel()
+  onStatusChanged: injectPanel()
+
+  Loader {
+    id: panelLoader
+    source: Qt.resolvedUrl("Panel.qml")
+    visible: false
+    onLoaded: {
+      root.injectPanel()
+      Qt.callLater(root.injectPanel)
+    }
+  }
+
   Process {
     id: watcher
     command: ["omawe", "watch"]
@@ -59,7 +92,7 @@ BarWidget {
     }
 
     onPressed: function(mouseButton) {
-      if (mouseButton === Qt.LeftButton) root.run("omawe pick")
+      if (mouseButton === Qt.LeftButton) panelLoader.item ? panelLoader.item.toggle() : root.run("omawe pick")
       else if (mouseButton === Qt.RightButton) root.run("omawe toggle")
       else if (mouseButton === Qt.MiddleButton) root.run("omawe random")
     }

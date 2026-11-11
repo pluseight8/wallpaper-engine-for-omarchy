@@ -6,6 +6,10 @@ set -euo pipefail
 ID=org.pluseight.omawe
 BIN="$HOME/.local/bin"
 
+# Hand back the theme that was active before theme sync replaced it.
+omawe set theme_sync false >/dev/null 2>&1 && sleep 3 || true
+rm -rf "$HOME/.config/omarchy/themes/omawe-live"
+
 systemctl --user disable --now omawed.service 2>/dev/null || true
 rm -f "$HOME/.config/systemd/user/omawed.service"
 systemctl --user daemon-reload

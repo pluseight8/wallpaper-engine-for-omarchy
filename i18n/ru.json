@@ -8,5 +8,30 @@
   "reason.fullscreen": "пауза за полноэкранным окном",
   "reason.battery": "экономия батареи",
   "reason.game": "остановлено на время игры",
-  "reason.error": "не удалось запустить"
+  "reason.error": "не удалось запустить",
+  "panel.search": "Печатайте для поиска",
+  "panel.all": "Все типы",
+  "panel.allMonitors": "Все мониторы",
+  "panel.properties": "Свойства",
+  "panel.library": "Библиотека",
+  "panel.favourites": "Только избранное",
+  "panel.pause": "Пауза / продолжить",
+  "panel.random": "Случайные обои",
+  "panel.sound": "Звук",
+  "panel.automute": "Без звука, пока играют другие приложения",
+  "panel.reactive": "Реакция на звук",
+  "panel.noProps": "У этих обоев нет настроек",
+  "panel.none": "Обои не выбраны",
+  "panel.presetName": "Имя пресета",
+  "panel.save": "Сохранить",
+  "panel.reset": "Сбросить",
+  "panel.presets": "Пресеты",
+  "panel.restart": "Изменение перезапускает обои на этом мониторе (около секунды)",
+  "panel.count": {
+    "one": "%1 обои",
+    "few": "%1 обоев",
+    "many": "%1 обоев",
+    "other": "%1 обоев"
+  },
+  "panel.hint": "Enter — применить · ПКМ — в избранное · Esc — закрыть"
 }

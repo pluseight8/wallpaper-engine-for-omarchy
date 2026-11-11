@@ -47,7 +47,12 @@ fn apply_pause_resume_stop() {
     let steam = root.join("home/.local/share/Steam");
     let workshop = steam.join("steamapps/workshop/content/431960");
     for (id, json) in [
-        ("111", r#"{"title":"Purple Nebula","type":"scene","preview":"preview.jpg"}"#),
+        (
+            "111",
+            r#"{"title":"Purple Nebula","type":"scene","preview":"preview.jpg","general":{"properties":{
+                "speed":{"type":"slider","min":0,"max":2,"value":1,"order":1},
+                "glow":{"type":"bool","value":false,"order":2}}}}"#,
+        ),
         ("222", r#"{"title":"Some App","type":"application"}"#),
     ] {
         std::fs::create_dir_all(workshop.join(id)).unwrap();
@@ -124,6 +129,41 @@ fn apply_pause_resume_stop() {
     std::fs::write(&cfg, text + "scaling = \"fit\"\n").unwrap();
     wait_for("config reload", || status()["pid"].as_u64().is_some_and(|p| p != pid));
     wait_for("old renderer gone", || proc_state(pid).is_none());
+
+    // A property change restarts that monitor's renderer with --set-property; bad values are refused.
+    let pid = status()["pid"].as_u64().unwrap();
+    let bad = request(&sock, json!({"cmd": "prop", "args": ["111", "speed", "fast"], "opts": {"monitor": "TEST-1"}}));
+    assert_eq!(bad["ok"], false);
+    let set = request(&sock, json!({"cmd": "prop", "args": ["111", "speed", "9"], "opts": {"monitor": "TEST-1"}}));
+    assert_eq!(set["data"], "2", "slider values are clamped to the declared range: {set}");
+    request(&sock, json!({"cmd": "prop", "args": ["111", "glow", "true"], "opts": {"monitor": "TEST-1"}}));
+    wait_for("property restart", || status()["pid"].as_u64().is_some_and(|p| p != pid));
+    let pid = status()["pid"].as_u64().unwrap();
+    let cmdline = std::fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap().replace('\0', " ");
+    assert!(cmdline.contains("--set-property glow=1 --set-property speed=2"), "{cmdline}");
+    let props = request(&sock, json!({"cmd": "props", "args": ["111"], "opts": {"monitor": "TEST-1"}}));
+    assert_eq!(props["data"]["props"][0]["key"], "speed");
+    assert_eq!(props["data"]["props"][0]["value"], "2");
+
+    // Presets: save, reset to defaults, load back.
+    request(&sock, json!({"cmd": "preset", "args": ["save", "111", "mine"], "opts": {"monitor": "TEST-1"}}));
+    request(&sock, json!({"cmd": "preset", "args": ["reset", "111"], "opts": {"monitor": "TEST-1"}}));
+    let props = request(&sock, json!({"cmd": "props", "args": ["111"], "opts": {"monitor": "TEST-1"}}));
+    assert_eq!(props["data"]["props"][0]["value"], "1");
+    request(&sock, json!({"cmd": "preset", "args": ["load", "111", "mine"], "opts": {"monitor": "TEST-1"}}));
+    let props = request(&sock, json!({"cmd": "props", "args": ["111"], "opts": {"monitor": "TEST-1"}}));
+    assert_eq!(props["data"]["props"][0]["value"], "2");
+    assert_eq!(props["data"]["presets"][0], "mine");
+
+    // Settings overrides: sound on, and a rejected value changes nothing.
+    assert_eq!(request(&sock, json!({"cmd": "set", "args": ["volume", "loud"]}))["ok"], false);
+    assert_eq!(request(&sock, json!({"cmd": "set", "args": ["nonsense", "1"]}))["ok"], false);
+    request(&sock, json!({"cmd": "volume", "args": ["40"]}));
+    request(&sock, json!({"cmd": "mute"}));
+    wait_for("audible renderer", || {
+        let pid = status()["pid"].as_u64().unwrap_or(0);
+        std::fs::read_to_string(format!("/proc/{pid}/cmdline")).is_ok_and(|c| c.replace('\0', " ").contains("--volume 40"))
+    });
 
     request(&sock, json!({"cmd": "stop"}));
     let pid = status()["pid"].as_u64();

@@ -1,6 +1,7 @@
 //! Hyprland IPC: the event socket wakes us up, the command socket answers what changed.
 
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -9,8 +10,8 @@ use tokio::sync::mpsc::Sender;
 #[derive(Default, Debug, PartialEq)]
 pub struct Snapshot {
     pub monitors: Vec<String>,
-    /// Every monitor's visible workspace is hidden behind a fullscreen (or maximized) window.
-    pub covered: bool,
+    /// Monitors whose visible workspace is hidden behind a fullscreen (or maximized) window.
+    pub covered: BTreeSet<String>,
     /// A Steam game window is open.
     pub game: bool,
 }
@@ -35,9 +36,10 @@ pub fn snapshot_from(monitors: &Value, clients: &Value, maximized: bool) -> Snap
         clients.iter().any(|c| c["workspace"]["id"].as_i64() == Some(ws) && c["fullscreen"].as_i64() >= Some(min_mode))
     };
     let mons = monitors.as_array().map(Vec::as_slice).unwrap_or_default();
+    let name = |m: &Value| m["name"].as_str().map(String::from);
     Snapshot {
-        monitors: mons.iter().filter_map(|m| m["name"].as_str().map(String::from)).collect(),
-        covered: !mons.is_empty() && mons.iter().all(|m| covers(m["activeWorkspace"]["id"].as_i64().unwrap_or(0))),
+        monitors: mons.iter().filter_map(name).collect(),
+        covered: mons.iter().filter(|m| covers(m["activeWorkspace"]["id"].as_i64().unwrap_or(0))).filter_map(name).collect(),
         game: clients.iter().any(|c| c["class"].as_str().is_some_and(|s| s.starts_with("steam_app_"))),
     }
 }
@@ -70,18 +72,19 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn covered_needs_every_monitor() {
+    fn covered_is_per_monitor() {
         let mons = json!([{"name": "A", "activeWorkspace": {"id": 1}}, {"name": "B", "activeWorkspace": {"id": 2}}]);
         let one = json!([{"workspace": {"id": 1}, "fullscreen": 2, "class": "mpv"}]);
         let both = json!([
             {"workspace": {"id": 1}, "fullscreen": 2, "class": "mpv"},
             {"workspace": {"id": 2}, "fullscreen": 1, "class": "steam_app_730"}
         ]);
-        assert!(!snapshot_from(&mons, &one, true).covered);
+        let set = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
+        assert_eq!(snapshot_from(&mons, &one, true).covered, set(&["A"]));
         let s = snapshot_from(&mons, &both, true);
-        assert!(s.covered && s.game && s.monitors == ["A", "B"]);
+        assert!(s.covered == set(&["A", "B"]) && s.game && s.monitors == ["A", "B"]);
         // A maximized window only counts when asked to.
-        assert!(!snapshot_from(&mons, &both, false).covered);
-        assert!(!snapshot_from(&json!([]), &both, true).covered);
+        assert_eq!(snapshot_from(&mons, &both, false).covered, set(&["A"]));
+        assert!(snapshot_from(&json!([]), &both, true).covered.is_empty());
     }
 }

@@ -8,5 +8,28 @@
   "reason.fullscreen": "paused behind a fullscreen window",
   "reason.battery": "saving battery",
   "reason.game": "stopped while a game runs",
-  "reason.error": "failed to start"
+  "reason.error": "failed to start",
+  "panel.search": "Type to search",
+  "panel.all": "All types",
+  "panel.allMonitors": "All monitors",
+  "panel.properties": "Properties",
+  "panel.library": "Library",
+  "panel.favourites": "Favourites only",
+  "panel.pause": "Pause / resume",
+  "panel.random": "Random wallpaper",
+  "panel.sound": "Sound",
+  "panel.automute": "Mute while other apps play",
+  "panel.reactive": "Audio-reactive",
+  "panel.noProps": "This wallpaper has no settings",
+  "panel.none": "No wallpaper selected",
+  "panel.presetName": "Preset name",
+  "panel.save": "Save",
+  "panel.reset": "Reset",
+  "panel.presets": "Presets",
+  "panel.restart": "Changes restart the wallpaper on that monitor (about a second)",
+  "panel.count": {
+    "one": "%1 wallpaper",
+    "other": "%1 wallpapers"
+  },
+  "panel.hint": "Enter: apply · right click: favourite · Esc: close"
 }

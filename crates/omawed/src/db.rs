@@ -4,7 +4,7 @@ use crate::project::Project;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 type Res<T> = Result<T, String>;
@@ -26,12 +26,18 @@ pub struct Wallpaper {
     pub dependency: String,
     #[serde(skip)]
     pub preset: String,
+    /// JSON object of property definitions from project.json, or "".
+    #[serde(skip)]
+    pub props: String,
+    /// Cached WebP thumbnail, filled in on request.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub thumb: String,
     pub fav: bool,
     /// "" (untested), "ok", "crash", "unsupported".
     pub compat: String,
 }
 
-const COLS: &str = "id, dir, title, kind, tags, rating, preview, dependency, preset, fav, compat";
+const COLS: &str = "id, dir, title, kind, tags, rating, preview, dependency, preset, fav, compat, props";
 
 fn row(r: &Row) -> rusqlite::Result<Wallpaper> {
     let dir: String = r.get(1)?;
@@ -49,6 +55,8 @@ fn row(r: &Row) -> rusqlite::Result<Wallpaper> {
         preset: r.get(8)?,
         fav: r.get(9)?,
         compat: r.get(10)?,
+        props: r.get(11)?,
+        thumb: String::new(),
     })
 }
 
@@ -63,7 +71,11 @@ impl Db {
                tags TEXT NOT NULL, rating TEXT NOT NULL, preview TEXT NOT NULL, mtime INTEGER NOT NULL,
                dependency TEXT NOT NULL, preset TEXT NOT NULL, props TEXT NOT NULL,
                fav INTEGER NOT NULL DEFAULT 0, compat TEXT NOT NULL DEFAULT '');
-             CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+             CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS props(wallpaper TEXT, monitor TEXT, key TEXT, value TEXT NOT NULL,
+               PRIMARY KEY(wallpaper, monitor, key));
+             CREATE TABLE IF NOT EXISTS presets(wallpaper TEXT, name TEXT, props TEXT NOT NULL,
+               PRIMARY KEY(wallpaper, name));",
         )
         .map_err(e)?;
         Ok(Db(c))
@@ -168,6 +180,55 @@ impl Db {
         let _ = self.0.execute("UPDATE wallpapers SET compat=?2 WHERE id=?1 AND compat != 'unsupported'", [id, compat]);
     }
 
+    /// User property values for a wallpaper: those set for every monitor ("*"), then this monitor's on top.
+    pub fn props(&self, wallpaper: &str, monitor: &str) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        for mon in ["*", monitor] {
+            let Ok(mut st) = self.0.prepare("SELECT key, value FROM props WHERE wallpaper=?1 AND monitor=?2") else { continue };
+            let rows = st.query_map([wallpaper, mon], |r| Ok((r.get(0)?, r.get(1)?)));
+            out.extend(rows.into_iter().flatten().flatten());
+        }
+        out
+    }
+
+    /// `value: None` puts the property back to its default.
+    pub fn set_prop(&self, wallpaper: &str, monitor: &str, key: &str, value: Option<&str>) -> Res<()> {
+        match value {
+            Some(v) => self.0.execute("INSERT OR REPLACE INTO props VALUES(?1, ?2, ?3, ?4)", [wallpaper, monitor, key, v]),
+            None => self.0.execute("DELETE FROM props WHERE wallpaper=?1 AND monitor=?2 AND key=?3", [wallpaper, monitor, key]),
+        }
+        .map(drop)
+        .map_err(e)
+    }
+
+    pub fn clear_props(&self, wallpaper: &str, monitor: &str) -> Res<()> {
+        self.0.execute("DELETE FROM props WHERE wallpaper=?1 AND monitor=?2", [wallpaper, monitor]).map(drop).map_err(e)
+    }
+
+    pub fn save_preset(&self, wallpaper: &str, name: &str, props: &BTreeMap<String, String>) -> Res<()> {
+        let json = serde_json::to_string(props).unwrap_or_default();
+        self.0.execute("INSERT OR REPLACE INTO presets VALUES(?1, ?2, ?3)", [wallpaper, name, &json]).map(drop).map_err(e)
+    }
+
+    pub fn preset(&self, wallpaper: &str, name: &str) -> Res<BTreeMap<String, String>> {
+        let json: Option<String> = self
+            .0
+            .query_row("SELECT props FROM presets WHERE wallpaper=?1 AND name=?2", [wallpaper, name], |r| r.get(0))
+            .optional()
+            .map_err(e)?;
+        json.and_then(|j| serde_json::from_str(&j).ok()).ok_or_else(|| format!("пресета «{name}» нет"))
+    }
+
+    pub fn presets(&self, wallpaper: &str) -> Res<Vec<String>> {
+        let mut st = self.0.prepare("SELECT name FROM presets WHERE wallpaper=?1 ORDER BY name").map_err(e)?;
+        let rows = st.query_map([wallpaper], |r| r.get(0)).map_err(e)?;
+        rows.collect::<Result<_, _>>().map_err(e)
+    }
+
+    pub fn remove_preset(&self, wallpaper: &str, name: &str) -> Res<()> {
+        self.0.execute("DELETE FROM presets WHERE wallpaper=?1 AND name=?2", [wallpaper, name]).map(drop).map_err(e)
+    }
+
     pub fn state(&self, key: &str) -> Option<String> {
         self.0.query_row("SELECT value FROM state WHERE key=?1", [key], |r| r.get(0)).ok()
     }
@@ -210,6 +271,21 @@ mod tests {
         let w = db.get("1").unwrap().unwrap();
         assert!(w.fav && w.compat == "ok" && w.title == "Purple Nebula II");
         assert_eq!(db.list(&serde_json::json!({"fav": true})).unwrap().len(), 1);
+
+        // Per-monitor values override the shared ones; presets round-trip.
+        db.set_prop("1", "*", "speed", Some("1")).unwrap();
+        db.set_prop("1", "*", "color", Some("1 0 0")).unwrap();
+        db.set_prop("1", "DP-1", "speed", Some("3")).unwrap();
+        assert_eq!(db.props("1", "DP-1")["speed"], "3");
+        assert_eq!(db.props("1", "HDMI-A-1")["speed"], "1");
+        db.save_preset("1", "fast", &db.props("1", "DP-1")).unwrap();
+        db.set_prop("1", "DP-1", "speed", None).unwrap();
+        db.clear_props("1", "*").unwrap();
+        assert!(db.props("1", "DP-1").is_empty());
+        assert_eq!(db.preset("1", "fast").unwrap()["color"], "1 0 0");
+        assert_eq!(db.presets("1").unwrap(), ["fast"]);
+        db.remove_preset("1", "fast").unwrap();
+        assert!(db.preset("1", "fast").is_err());
 
         db.set_state("k", "v");
         assert_eq!(db.state("k").as_deref(), Some("v"));
