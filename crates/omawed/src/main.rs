@@ -227,6 +227,10 @@ struct Daemon {
     /// Next playlist timer / time-of-day deadline.
     interval_at: Option<Instant>,
     hours_at: Option<Instant>,
+    /// The monitor set changed recently. Hyprland can add an output and drop it again within a second
+    /// (a config reload re-enables a panel that a script then turns off); a renderer started on it then
+    /// dies in its own start-up and looks like a broken wallpaper.
+    settle_until: Option<Instant>,
 }
 
 impl Daemon {
@@ -542,7 +546,9 @@ impl Daemon {
                 terminate(&mut slot.old);
                 continue;
             };
-            if slot.cur.as_ref().is_none_or(|c| c.args != args) && slot.crashed.as_ref() != Some(&args) {
+            // While monitors settle, renderers already on screen keep going but none start on a new output.
+            let settling = self.settle_until.is_some() && slot.cur.is_none();
+            if !settling && slot.cur.as_ref().is_none_or(|c| c.args != args) && slot.crashed.as_ref() != Some(&args) {
                 match self.spawn(args, id) {
                     Ok(new) => {
                         self.error.clear();
@@ -643,14 +649,17 @@ impl Daemon {
     }
 
     fn on_exit(&mut self, pid: u32) {
-        for slot in self.slots.values_mut() {
+        let settling = self.settle_until.is_some();
+        for (monitor, slot) in self.slots.iter_mut() {
             if slot.old.as_ref().is_some_and(|o| o.pid == pid) {
                 slot.old = None;
             }
             let Some(dead) = slot.cur.take_if(|c| c.pid == pid) else { continue };
             let _ = std::fs::remove_file(&dead.frame);
-            // A renderer that died while stopped was most likely dropped by the compositor; just start again.
-            if !dead.paused {
+            // Not the wallpaper's fault, so just start again: a renderer that died while stopped (dropped by
+            // the compositor), or whose output went away or was being reconfigured.
+            let output_changed = settling || !self.snap.monitors.contains(monitor);
+            if !dead.paused && !output_changed {
                 if !dead.ready {
                     self.db.set_compat(&dead.id, "crash");
                 }
@@ -1155,6 +1164,7 @@ impl Daemon {
             // A renderer started while a monitor was still coming up may have died; try again on hotplug.
             if snap.monitors != self.snap.monitors {
                 self.retry_crashed();
+                self.settle_until = Some(Instant::now() + Duration::from_millis(2500));
             }
             self.snap = snap;
         }
@@ -1305,6 +1315,7 @@ async fn main() -> Res<()> {
         testing: None,
         interval_at: None,
         hours_at: None,
+        settle_until: None,
     };
     d.sources = d.find_sources();
     d.rescan()?;
@@ -1337,7 +1348,7 @@ async fn main() -> Res<()> {
         d.status.send_if_modified(|s| if *s != now { *s = now; true } else { false });
 
         // Earliest playlist deadline, if a playlist is configured at all.
-        let deadline = [d.interval_at, d.hours_at].into_iter().flatten().min();
+        let deadline = [d.interval_at, d.hours_at, d.settle_until].into_iter().flatten().min();
         tokio::select! {
             Some(ev) = rx.recv() => match ev {
                 Event::Request(req, reply) => {
@@ -1367,7 +1378,14 @@ async fn main() -> Res<()> {
                 Event::Workshop(reply) => d.on_workshop(&reply),
             },
             Some(()) = hypr_rx.recv() => d.refresh_snapshot().await,
-            _ = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now)), if deadline.is_some() => d.on_tick(),
+            _ = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now)), if deadline.is_some() => {
+                if d.settle_until.is_some_and(|t| t <= Instant::now()) {
+                    d.settle_until = None;
+                }
+                if [d.interval_at, d.hours_at].into_iter().flatten().any(|t| t <= Instant::now()) {
+                    d.on_tick();
+                }
+            }
             _ = term.recv() => break,
             _ = int.recv() => break,
         }
