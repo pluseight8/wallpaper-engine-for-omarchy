@@ -1,5 +1,10 @@
 # omawe — Wallpaper Engine для Omarchy
 
+*Steam Wallpaper Engine wallpapers on Omarchy: library browser, per-monitor and per-workspace wallpapers, property editor,
+playlists, auto-pause behind fullscreen windows and on battery, and an Omarchy theme generated from the wallpaper.
+Needs `linux-wallpaperengine` and a Steam copy of Wallpaper Engine. Install: clone and run `./install.sh`; remove: `./uninstall.sh`.
+The rest of this document is in Russian.*
+
 Живые обои из Steam Wallpaper Engine на рабочем столе Omarchy (Hyprland + Quickshell).
 Рендерит [linux-wallpaperengine](https://github.com/Almamu/linux-wallpaperengine); omawe управляет им:
 библиотека, применение по мониторам, пауза, экономия батареи.
@@ -7,7 +12,7 @@
 Нужна легальная копия Wallpaper Engine в Steam. omawe ничего из неё не копирует и не распространяет:
 он только читает `project.json` и передаёт пути рендереру.
 
-> Состояние: **этап 3** из четырёх. Не сделаны TUI, `PKGBUILD` и пауза при блокировке экрана — см. «Ограничения» и «План».
+> Состояние: все четыре этапа сделаны. Чего нет и почему — в разделе «Ограничения».
 
 ## Требования
 
@@ -22,9 +27,11 @@
 git clone https://github.com/pluseight8/wallpaper-engine-for-omarchy && cd wallpaper-engine-for-omarchy && ./install.sh
 ```
 
+Пакетом: в репозитории есть `PKGBUILD` (`makepkg -si`), после установки один раз выполните `omawe-integrate`.
+
 `install.sh` можно запускать повторно. Он:
 
-- собирает и кладёт в `~/.local/bin`: `omawed`, `omawe`, `omawe-pick`, `omawe-integrate`;
+- собирает и кладёт в `~/.local/bin`: `omawed`, `omawe`, `omawe-tui`, `omawe-pick`, `omawe-doctor`, `omawe-integrate`;
 - ставит user-юнит `omawed.service` и включает его;
 - копирует плагин оболочки в `~/.config/omarchy/plugins/org.pluseight.omawe` и включает виджет в баре;
 - добавляет меню > Style > Wallpaper Engine, бинды (`~/.config/hypr/omawe.lua`), хуки `theme-set` и `post-update`;
@@ -38,6 +45,7 @@ git clone https://github.com/pluseight8/wallpaper-engine-for-omarchy && cd wallp
 |---|---|
 | Панель: библиотека, фильтры, свойства, звук | ЛКМ по значку в баре |
 | Быстрый выбор на весь экран | `Super+Alt+W`, меню > Style > Wallpaper Engine |
+| Браузер в терминале (TUI) | `Super+Alt+Shift+W`, `omawe tui`, меню > Style > Wallpaper Engine |
 | Следующие / предыдущие | `Super+Alt+]` / `Super+Alt+[`, колесо на значке |
 | Пауза | `Super+Alt+\`, ПКМ по значку |
 | Случайные | СКМ по значку, `omawe random` |
@@ -65,6 +73,12 @@ omawe status | watch | rescan | config
 ```
 
 Без `--monitor` обои и свойства задаются для всех мониторов, с ним — только для указанного.
+
+### TUI
+
+`omawe tui` — браузер библиотеки в терминале в цветах текущей темы: список с поиском (`/`), фильтр по типу (`t`) и избранному (`F`),
+превью выбранных обоев, выбор монитора (`m`), редактор свойств (`p`), пауза (пробел), звук (`s`), страница в Workshop (`o`).
+Превью рисуется полублоками через ImageMagick, поэтому работает в любом терминале. Протокол kitty graphics не используется.
 
 ### Свойства обоев
 
@@ -199,7 +213,7 @@ GPU считан из `/proc/<pid>/fdinfo` (драйвер `xe`), без `intel_
 1. ✅ MVP: библиотека, применение, пауза, питание, пикер, виджет, установка.
 2. ✅ Свойства обоев и пресеты, плейлисты, звук, панель-браузер с фильтрами и редактором, тема из палитры обоев.
 3. ✅ Плейлист по цветам темы, профиль низкого заряда, обои по воркспейсам, автотест совместимости, данные Workshop, `omawe doctor`.
-4. TUI, `PKGBUILD`, заявка в plugins.omarchy.org.
+4. ✅ TUI, `PKGBUILD`. Заявка в plugins.omarchy.org подготовлена, но не отправлена.
 
 Факты о системе и обоснование решений: [docs/DISCOVERY.md](docs/DISCOVERY.md).
 

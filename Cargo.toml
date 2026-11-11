@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/omawed", "crates/omawe-cli"]
+members = ["crates/omawed", "crates/omawe-cli", "crates/omawe-tui"]
 
 [workspace.package]
 version = "0.1.0"

@@ -6,7 +6,10 @@ set -euo pipefail
 MENU="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
 HYPR="$HOME/.config/hypr/hyprland.lua"
 HOOKS="$HOME/.config/omarchy/hooks"
+# Files come from install.sh's per-user copy, or from the system package.
 SHARE="${XDG_DATA_HOME:-$HOME/.local/share}/omawe/integration"
+[[ -d $SHARE ]] || SHARE=/usr/share/omawe/integration
+PLUGIN="$HOME/.config/omarchy/plugins/org.pluseight.omawe"
 REQUIRE='require("hypr.omawe") -- omawe key bindings'
 
 # Our block always goes out first, so re-running never duplicates it.
@@ -17,6 +20,7 @@ if [[ ${1:-} == --remove ]]; then
   rm -f "$HOOKS/theme-set.d/50-omawe" "$HOOKS/post-update.d/50-omawe"
   exit 0
 fi
+systemctl --user daemon-reload
 
 # Menu > Style > Wallpaper Engine
 mkdir -p "$(dirname "$MENU")"
@@ -27,6 +31,7 @@ if [[ $(tail -n 1 "$MENU") == "}" ]]; then
 // omawe-menu-start
   "style.omawe": {"icon":"󰸉","label":"Wallpaper Engine","keywords":"live animated wallpaper steam workshop omawe"},
   "style.omawe.pick": {"icon":"󰸉","label":"Pick wallpaper","action":"omawe pick"},
+  "style.omawe.tui": {"icon":"","label":"Browse in terminal","action":"omarchy-launch-or-focus-tui omawe-tui"},
   "style.omawe.favourites": {"icon":"󰓎","label":"Favourites","action":"omawe pick --fav"},
   "style.omawe.next": {"icon":"󰒭","label":"Next","action":"omawe next"},
   "style.omawe.random": {"icon":"󰒟","label":"Random","action":"omawe random"},
@@ -47,5 +52,15 @@ fi
 
 install -Dm755 "$SHARE/hooks/theme-set" "$HOOKS/theme-set.d/50-omawe"
 install -Dm755 "$SHARE/hooks/post-update" "$HOOKS/post-update.d/50-omawe"
+
+# The system package ships the shell plugin outside the home directory; the shell only loads it from there.
+if [[ -d /usr/share/omawe/plugin ]] && ! diff -rq /usr/share/omawe/plugin "$PLUGIN" >/dev/null 2>&1; then
+  rm -rf "$PLUGIN"
+  mkdir -p "$PLUGIN"
+  cp -r /usr/share/omawe/plugin/. "$PLUGIN/"
+  omarchy plugin enable org.pluseight.omawe >/dev/null 2>&1 || true
+  # The shell keeps the previous version of a loaded widget until it restarts.
+  omarchy restart shell >/dev/null 2>&1 || true
+fi
 
 systemctl --user is-enabled -q omawed.service 2>/dev/null || systemctl --user enable -q omawed.service || true

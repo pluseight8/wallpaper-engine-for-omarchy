@@ -9,6 +9,7 @@ use std::process::exit;
 const USAGE: &str = "omawe — Wallpaper Engine для Omarchy
 
   omawe pick                         открыть выбор обоев с превью
+  omawe tui                          браузер библиотеки в терминале
   omawe apply <id|название> [--monitor M] [--scaling fill|fit|stretch|default] [--clamp clamp|border|repeat]
   omawe next | prev | random [--type T] [--tag T] [--fav] [--monitor M]
   omawe pause | resume | toggle
@@ -40,7 +41,7 @@ fn main() {
         Some(c) if !matches!(c.as_str(), "help" | "-h" | "--help") => c,
         _ => return println!("{USAGE}"),
     };
-    if cmd == "pick" || cmd == "doctor" {
+    if matches!(cmd.as_str(), "pick" | "doctor" | "tui") {
         let script = format!("omawe-{cmd}");
         let err = std::process::Command::new(&script).args(argv).exec();
         eprintln!("{script}: {err}");

@@ -1,0 +1,12 @@
+post_install() {
+  echo ":: omawe: run 'omawe-integrate' as your user to add the shell plugin, menu entry, key bindings and hooks,"
+  echo "   then 'systemctl --user start omawed'. 'omawe doctor' checks the result."
+}
+
+post_upgrade() {
+  echo ":: omawe: run 'omawe-integrate' as your user to update the shell plugin."
+}
+
+pre_remove() {
+  echo ":: omawe: per-user integration stays until you run 'omawe-integrate --remove' and 'omarchy plugin remove org.pluseight.omawe'."
+}
