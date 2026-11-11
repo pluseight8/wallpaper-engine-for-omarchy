@@ -1,3 +1,4 @@
 #!/bin/bash
-# After `omarchy update`: re-check the integration points and repair what an update moved.
-command -v omawe-integrate >/dev/null && omawe-integrate || true
+# After `omarchy update`: repair the integration points an update may have moved, then report.
+command -v omawe-doctor >/dev/null || exit 0
+omawe-doctor --fix >/dev/null 2>&1 || omarchy-notification-send "omawe: после обновления есть проблемы — omawe doctor" -t 6000

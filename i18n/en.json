@@ -31,6 +31,6 @@
     "one": "%1 wallpaper",
     "other": "%1 wallpapers"
   },
-  "panel.hint": "Enter: apply · right click: favourite · Esc: close",
+  "panel.hint": "Enter: apply · right click: favourite · middle click: Workshop page · Esc: close",
   "panel.theme": "Theme from wallpaper"
 }

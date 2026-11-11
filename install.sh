@@ -28,7 +28,7 @@ cargo build --release --locked
 
 say "Установка"
 systemctl --user stop omawed.service 2>/dev/null || true
-install -Dm755 target/release/omawed target/release/omawe integration/bin/omawe-pick integration/bin/omawe-integrate -t "$BIN"
+install -Dm755 target/release/omawed target/release/omawe integration/bin/omawe-pick integration/bin/omawe-integrate integration/bin/omawe-doctor -t "$BIN"
 rm -rf "$SHARE"
 mkdir -p "$SHARE"
 cp -r integration/hypr integration/hooks "$SHARE/"

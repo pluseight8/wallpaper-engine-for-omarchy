@@ -52,6 +52,15 @@ enum Event {
     LibraryChanged,
     ConfigChanged,
     ThumbsDone,
+    /// Battery charge in percent.
+    Percent(f64),
+    /// Most vivid colour of a wallpaper's preview.
+    Color(String, String),
+    /// Compatibility test result: wallpaper id, verdict, frame it drew.
+    Tested(String, &'static str, PathBuf),
+    TestsDone,
+    /// Raw GetPublishedFileDetails reply.
+    Workshop(Vec<u8>),
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
@@ -96,6 +105,10 @@ fn xdg(var: &str, home_rel: &str) -> PathBuf {
 }
 
 fn signal_group(pid: u32, sig: i32) {
+    // kill(-0) would signal our own process group, the daemon included.
+    if pid == 0 {
+        return;
+    }
     // The renderer runs in its own process group, so wrapper scripts and helpers get the signal too.
     unsafe { libc::kill(-(pid as i32), sig) };
 }
@@ -117,6 +130,31 @@ fn run(cmd: &str, args: &[&str]) {
 fn discharging() -> bool {
     let Ok(dir) = std::fs::read_dir("/sys/class/power_supply") else { return false };
     dir.flatten().any(|e| std::fs::read_to_string(e.path().join("status")).is_ok_and(|s| s.trim() == "Discharging"))
+}
+
+/// Work out an image's most vivid colour and report it.
+async fn send_color(tx: &UnboundedSender<Event>, id: String, image: &std::path::Path) {
+    let out = tokio::process::Command::new("magick")
+        .arg(image)
+        .args(["-colors", "6", "-format", "%c", "histogram:info:-"])
+        .stderr(Stdio::null())
+        .output()
+        .await;
+    // "-" marks "looked, found nothing", so a broken image is not retried on every list.
+    let color = out.ok().and_then(|o| theme::vivid(&theme::parse_histogram(&String::from_utf8_lossy(&o.stdout))));
+    let _ = tx.send(Event::Color(id, color.unwrap_or_else(|| "-".into())));
+}
+
+/// Accent of the Omarchy theme in use.
+fn theme_accent() -> Option<String> {
+    let path = xdg("XDG_STATE_HOME", ".local/state").join("omarchy/current/theme/colors.toml");
+    theme::accent(&std::fs::read_to_string(path).ok()?)
+}
+
+/// Where an apply/stop/step is aimed: one workspace, one monitor, or everything (None).
+fn target_key(opts: &Value) -> Option<String> {
+    let opt = |k: &str| opts.get(k).and_then(Value::as_str);
+    opt("workspace").map(|w| format!("ws:{w}")).or(opt("monitor").map(String::from))
 }
 
 /// A project.json value the way `--set-property` takes it.
@@ -183,6 +221,9 @@ struct Daemon {
     error: String,
     spawned: u32,
     thumbing: bool,
+    percent: f64,
+    /// Compatibility test progress: done, total.
+    testing: Option<(usize, usize)>,
     /// Next playlist timer / time-of-day deadline.
     interval_at: Option<Instant>,
     hours_at: Option<Instant>,
@@ -263,8 +304,9 @@ impl Daemon {
             let thumb = self.thumb(&w.id);
             if thumb.exists() {
                 w.thumb = thumb.to_string_lossy().into_owned();
-            } else {
-                jobs.push((w.preview.clone(), thumb));
+            }
+            if w.thumb.is_empty() || w.color.is_empty() {
+                jobs.push((w.id.clone(), w.preview.clone(), thumb));
             }
         }
         if jobs.is_empty() || self.thumbing {
@@ -274,7 +316,11 @@ impl Daemon {
         let tx = self.tx.clone();
         tokio::spawn(async move {
             // One low-priority conversion at a time: opening the browser must not spin up every core.
-            for (preview, thumb) in jobs {
+            for (id, preview, thumb) in jobs {
+                if thumb.exists() {
+                    send_color(&tx, id, &thumb).await;
+                    continue;
+                }
                 let tmp = thumb.with_extension("tmp.webp");
                 let done = tokio::process::Command::new("nice")
                     .args(["-n", "19", "magick"])
@@ -286,6 +332,7 @@ impl Daemon {
                     .await;
                 if done.is_ok_and(|s| s.success()) {
                     let _ = std::fs::rename(&tmp, &thumb);
+                    send_color(&tx, id, &thumb).await;
                 } else {
                     let _ = std::fs::remove_file(&tmp);
                 }
@@ -344,7 +391,7 @@ impl Daemon {
     fn monitors(&self) -> Vec<String> {
         if self.snap.monitors.is_empty() {
             // No compositor answer (tests, early start): trust explicit per-monitor assignments.
-            self.assign.keys().filter(|k| *k != ALL).cloned().collect()
+            self.assign.keys().filter(|k| *k != ALL && !k.starts_with("ws:")).cloned().collect()
         } else {
             self.snap.monitors.clone()
         }
@@ -353,7 +400,10 @@ impl Daemon {
     fn shown(&self) -> Vec<(String, Assign, Wallpaper)> {
         let mut out = Vec::new();
         for mon in self.monitors() {
-            let Some(a) = self.assign.get(&mon).or_else(|| self.assign.get(ALL)) else { continue };
+            // Most specific wins: the visible workspace, then the monitor, then "everywhere".
+            let ws = self.snap.workspaces.get(&mon).map(|id| format!("ws:{id}"));
+            let a = ws.and_then(|k| self.assign.get(&k)).or_else(|| self.assign.get(&mon)).or_else(|| self.assign.get(ALL));
+            let Some(a) = a else { continue };
             if let Ok(Some(w)) = self.db.get(&a.id) {
                 out.push((mon, a.clone(), w));
             }
@@ -365,11 +415,22 @@ impl Daemon {
         if self.on_battery { self.cfg.fps_battery } else { self.cfg.fps_ac }
     }
 
+    /// Power profile in force: the `battery` mode, or `low_battery` once the charge is low. None on AC.
+    fn battery_mode(&self) -> Option<&str> {
+        if !self.on_battery {
+            None
+        } else if self.percent <= f64::from(self.cfg.low_battery_percent) {
+            Some(&self.cfg.low_battery)
+        } else {
+            Some(&self.cfg.battery)
+        }
+    }
+
     /// Why no renderer should exist at all right now.
     fn stop_reason(&self) -> Option<&'static str> {
         if self.cfg.stop_on_game && self.snap.game {
             Some("game")
-        } else if self.on_battery && self.cfg.battery == "static" {
+        } else if self.battery_mode() == Some("static") {
             Some("battery")
         } else {
             None
@@ -381,7 +442,7 @@ impl Daemon {
             Some("manual")
         } else if self.cfg.pause_fullscreen && self.snap.covered.contains(monitor) {
             Some("fullscreen")
-        } else if self.on_battery && self.cfg.battery == "pause" {
+        } else if self.battery_mode() == Some("pause") {
             Some("battery")
         } else {
             None
@@ -613,7 +674,148 @@ impl Daemon {
     // ---- playlist ----------------------------------------------------------
 
     fn playlist_filter(&self) -> Value {
-        json!(self.cfg.playlist.filter)
+        let mut filter = json!(self.cfg.playlist.filter);
+        // With theme sync the theme follows the wallpaper, so matching it back would be circular.
+        if self.cfg.playlist.match_theme && !self.cfg.theme_sync {
+            filter["match-theme"] = json!(true);
+        }
+        filter
+    }
+
+    /// `db.list` plus the one filter SQL cannot do: colour match with the current theme.
+    fn listed(&self, opts: &Value) -> Res<Vec<Wallpaper>> {
+        let mut list = self.db.list(opts)?;
+        if opts.get("match-theme").is_some() {
+            let accent = theme_accent().ok_or("не удалось прочитать цвета текущей темы")?;
+            list.retain(|w| theme::matches(&w.color, &accent));
+        }
+        Ok(list)
+    }
+
+    // ---- compatibility test ------------------------------------------------
+
+    /// Render each wallpaper for a moment on the background layer, under everything, and record
+    /// whether it drew a frame, drew black, or crashed. Runs one at a time.
+    fn start_test(&mut self, query: Option<&str>, all: bool) -> Res<usize> {
+        if self.testing.is_some() {
+            return Err("проверка уже идёт".into());
+        }
+        let monitor = self.monitors().into_iter().next().ok_or("нет мониторов")?;
+        let candidates = match query {
+            Some(q) => vec![self.db.find(q)?],
+            None => self.db.list(&json!({}))?.into_iter().filter(|w| all || w.compat.is_empty()).collect(),
+        };
+        let jobs: Vec<(String, String)> = candidates
+            .into_iter()
+            .filter(|w| w.compat != "unsupported")
+            .filter_map(|w| Some((w.id.clone(), self.base(&w)?.0)))
+            .collect();
+        let total = jobs.len();
+        if total == 0 {
+            return Ok(0);
+        }
+        self.testing = Some((0, total));
+        let (tx, backend, twins) = (self.tx.clone(), self.cfg.backend.clone(), self.dirs.cache.join("twins"));
+        tokio::spawn(async move {
+            for (id, dir) in jobs {
+                let frame = twins.join(format!(".test-{id}.png"));
+                let _ = std::fs::remove_file(&frame);
+                let child = tokio::process::Command::new(&backend)
+                    .args(["--silent", "--fps", "10", "--layer", "background", "--screen-root", &monitor, "--bg", &dir, "--screenshot"])
+                    .arg(&frame)
+                    .process_group(0)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn();
+                let mut verdict = "crash";
+                if let Ok(mut child) = child {
+                    // Taken now: after the child has been reaped it has no id any more.
+                    let pid = child.id().unwrap_or_default();
+                    verdict = "noframe";
+                    for _ in 0..80 {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        if std::fs::metadata(&frame).is_ok_and(|m| m.len() > 0) {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            verdict = "ok";
+                            break;
+                        }
+                        if matches!(child.try_wait(), Ok(Some(_))) {
+                            verdict = "crash";
+                            break;
+                        }
+                    }
+                    signal_group(pid, libc::SIGTERM);
+                    let _ = child.wait().await;
+                }
+                if verdict == "ok" {
+                    let mean = tokio::process::Command::new("magick").arg(&frame).args(["-format", "%[fx:mean]", "info:"]).output().await;
+                    let mean = mean.ok().and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<f64>().ok());
+                    if mean.is_some_and(|m| m < 0.02) {
+                        verdict = "black";
+                    }
+                }
+                let _ = tx.send(Event::Tested(id, verdict, frame));
+            }
+            let _ = tx.send(Event::TestsDone);
+        });
+        Ok(total)
+    }
+
+    fn on_tested(&mut self, id: &str, verdict: &str, frame: PathBuf) {
+        self.db.set_compat(id, verdict);
+        // A good frame doubles as the still twin, so the first real apply is seamless.
+        if verdict != "ok" || self.twin(id).exists() || std::fs::rename(&frame, self.twin(id)).is_err() {
+            let _ = std::fs::remove_file(&frame);
+        }
+        if let Some((done, _)) = self.testing.as_mut() {
+            *done += 1;
+        }
+    }
+
+    // ---- workshop ----------------------------------------------------------
+
+    /// Ask Steam's public, keyless API about every Workshop item in the library.
+    fn start_workshop_sync(&mut self) -> Res<usize> {
+        let ids: Vec<String> = self
+            .db
+            .list(&json!({}))?
+            .into_iter()
+            .map(|w| w.id)
+            .filter(|id| id.len() <= 20 && id.bytes().all(|b| b.is_ascii_digit()))
+            .collect();
+        let (tx, total) = (self.tx.clone(), ids.len());
+        tokio::spawn(async move {
+            for chunk in ids.chunks(100) {
+                let mut body = format!("itemcount={}", chunk.len());
+                for (i, id) in chunk.iter().enumerate() {
+                    body += &format!("&publishedfileids[{i}]={id}");
+                }
+                // Fixed HTTPS endpoint, a time limit and a size cap; the reply is parsed, never executed.
+                let out = tokio::process::Command::new("curl")
+                    .args(["-sS", "--max-time", "20", "--max-filesize", "8000000", "--data", &body])
+                    .arg("https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/")
+                    .stderr(Stdio::null())
+                    .output()
+                    .await;
+                if let Ok(out) = out {
+                    let _ = tx.send(Event::Workshop(out.stdout));
+                }
+            }
+        });
+        Ok(total)
+    }
+
+    fn on_workshop(&mut self, reply: &[u8]) {
+        let Ok(v) = serde_json::from_slice::<Value>(reply) else { return };
+        for item in v["response"]["publishedfiledetails"].as_array().into_iter().flatten() {
+            let Some(id) = item["publishedfileid"].as_str() else { continue };
+            // Only items we asked about and Steam knows.
+            if item["result"] == 1 && matches!(self.db.get(id), Ok(Some(_))) {
+                let n = |key: &str| item[key].as_i64().unwrap_or(0);
+                self.db.set_workshop(id, n("subscriptions"), n("favorited"), n("time_updated"));
+            }
+        }
     }
 
     /// Apply the time-of-day entry if it is not already showing, and arm both deadlines.
@@ -694,6 +896,8 @@ impl Daemon {
             "pid": first.map(|m| m["pid"].clone()),
             "fps": self.fps(),
             "on_battery": self.on_battery,
+            "battery_percent": self.percent,
+            "testing": self.testing,
             "silent": self.cfg.silent,
             "volume": self.cfg.volume,
             "monitors": monitors,
@@ -709,10 +913,11 @@ impl Daemon {
         }
         let opt = |k: &str| opts.get(k).and_then(Value::as_str).map(String::from);
         let a = Assign { id: w.id.clone(), scaling: opt("scaling"), clamp: opt("clamp") };
-        match opt("monitor") {
-            Some(mon) => self.assign.insert(mon, a),
+        match target_key(opts) {
+            Some(key) => self.assign.insert(key, a),
             None => {
-                self.assign.clear();
+                // "Everywhere" replaces per-monitor choices but leaves per-workspace ones in place.
+                self.assign.retain(|k, _| k.starts_with("ws:"));
                 self.assign.insert(ALL.into(), a)
             }
         };
@@ -723,12 +928,12 @@ impl Daemon {
 
     /// next / prev / random within the (optionally filtered) library.
     fn step(&mut self, cmd: &str, opts: &Value) -> Res<Reply> {
-        let list: Vec<_> = self.db.list(opts)?.into_iter().filter(|w| w.compat != "unsupported" && w.compat != "crash").collect();
+        let list: Vec<_> = self.listed(opts)?.into_iter().filter(|w| !matches!(w.compat.as_str(), "unsupported" | "crash" | "black")).collect();
         if list.is_empty() {
             return Err("подходящих обоев нет".into());
         }
-        let mon = opts.get("monitor").and_then(Value::as_str).unwrap_or(ALL);
-        let cur = self.assign.get(mon).or_else(|| self.assign.get(ALL)).map(|a| a.id.clone());
+        let key = target_key(opts).unwrap_or_else(|| ALL.into());
+        let cur = self.assign.get(&key).or_else(|| self.assign.get(ALL)).map(|a| a.id.clone());
         let pos = list.iter().position(|w| Some(&w.id) == cur.as_ref());
         let n = list.len();
         let i = match (cmd, pos) {
@@ -739,7 +944,7 @@ impl Daemon {
             (_, None) => 0,
         };
         // Only the monitor travels on: list filters are not apply options.
-        self.apply(&list[i].clone(), &json!({"monitor": opts.get("monitor")}))
+        self.apply(&list[i].clone(), &json!({"monitor": opts.get("monitor"), "workspace": opts.get("workspace")}))
     }
 
     /// Store a setting override and reload; a value the config rejects is not kept.
@@ -784,7 +989,7 @@ impl Daemon {
                 Ok((format!("{}{reason}: {title}", s["state"].as_str().unwrap_or_default()), s))
             }
             "list" => {
-                let mut list = self.db.list(&opts)?;
+                let mut list = self.listed(&opts)?;
                 if opts.get("thumbs").is_some() {
                     self.attach_thumbs(&mut list);
                 }
@@ -801,8 +1006,8 @@ impl Daemon {
             }
             cmd @ ("next" | "prev" | "random") => self.step(cmd, &opts),
             "stop" => {
-                match opts.get("monitor").and_then(Value::as_str) {
-                    Some(mon) => drop(self.assign.remove(mon)),
+                match target_key(&opts) {
+                    Some(key) => drop(self.assign.remove(&key)),
                     None => self.assign.clear(),
                 }
                 self.save();
@@ -887,10 +1092,44 @@ impl Daemon {
                 let (updated, removed) = self.rescan()?;
                 Ok((format!("обновлено {updated}, удалено {removed}"), json!({"updated": updated, "removed": removed})))
             }
-            // Re-assert the still frame as Omarchy's background (after a theme change).
+            // After a theme change: re-assert the still frame as Omarchy's background, and with
+            // playlist.match_theme move on if the wallpaper no longer suits the theme.
             "refresh" => {
+                let filter = self.playlist_filter();
+                let current = self.shown().into_iter().next().map(|(_, _, w)| w);
+                let suits = theme_accent().zip(current).is_none_or(|(accent, w)| theme::matches(&w.color, &accent));
+                if filter.get("match-theme").is_some() && !suits {
+                    return self.step(if self.cfg.playlist.random { "random" } else { "next" }, &filter);
+                }
                 self.sync_omarchy_bg();
                 Ok((String::new(), Value::Null))
+            }
+            // test [wallpaper] [--all]: without arguments, every wallpaper not tested yet.
+            "test" => {
+                let total = self.start_test(arg(0), opts.get("all").is_some())?;
+                Ok((format!("проверяю обоев: {total}; ход — в omawe status"), json!(total)))
+            }
+            "workshop" => match arg(0) {
+                Some("sync") => {
+                    let total = self.start_workshop_sync()?;
+                    Ok((format!("запрашиваю данные Workshop для {total} обоев"), json!(total)))
+                }
+                _ => Err("нужно: omawe workshop sync".into()),
+            },
+            // open [wallpaper]: its Workshop page in Steam, or the Workshop itself.
+            "open" => {
+                let url = match arg(0) {
+                    Some(q) => {
+                        let w = self.db.find(q)?;
+                        if !w.id.bytes().all(|b| b.is_ascii_digit()) {
+                            return Err(format!("«{}» — локальный проект, страницы в Workshop нет", w.title));
+                        }
+                        format!("steam://url/CommunityFilePage/{}", w.id)
+                    }
+                    None => format!("steam://url/SteamWorkshopPage/{APPID}"),
+                };
+                run("xdg-open", &[&url]);
+                Ok((String::new(), json!(url)))
             }
             "config" => Ok((toml::to_string(&self.cfg).unwrap_or_default(), json!({"config": self.cfg, "overrides": self.overrides}))),
             other => Err(format!("неизвестная команда: {other}")),
@@ -934,14 +1173,30 @@ trait UPower {
     fn on_battery(&self) -> zbus::Result<bool>;
 }
 
+#[zbus::proxy(
+    interface = "org.freedesktop.UPower.Device",
+    default_service = "org.freedesktop.UPower",
+    default_path = "/org/freedesktop/UPower/devices/DisplayDevice"
+)]
+trait Device {
+    #[zbus(property)]
+    fn percentage(&self) -> zbus::Result<f64>;
+}
+
 async fn watch_battery(tx: UnboundedSender<Event>) -> zbus::Result<()> {
-    let proxy = UPowerProxy::new(&zbus::Connection::system().await?).await?;
-    let _ = tx.send(Event::Battery(proxy.on_battery().await?));
-    let mut changes = proxy.receive_on_battery_changed().await;
-    while let Some(change) = changes.next().await {
-        let _ = tx.send(Event::Battery(change.get().await?));
+    let bus = zbus::Connection::system().await?;
+    let (power, device) = (UPowerProxy::new(&bus).await?, DeviceProxy::new(&bus).await?);
+    let _ = tx.send(Event::Battery(power.on_battery().await?));
+    let _ = tx.send(Event::Percent(device.percentage().await?));
+    let mut plugged = power.receive_on_battery_changed().await;
+    let mut charge = device.receive_percentage_changed().await;
+    loop {
+        tokio::select! {
+            Some(change) = plugged.next() => drop(tx.send(Event::Battery(change.get().await?))),
+            Some(change) = charge.next() => drop(tx.send(Event::Percent(change.get().await?))),
+            else => return Ok(()),
+        }
     }
-    Ok(())
 }
 
 async fn watch_files(tx: UnboundedSender<Event>, config_dir: PathBuf, sources: Vec<PathBuf>) -> std::io::Result<()> {
@@ -1046,6 +1301,8 @@ async fn main() -> Res<()> {
         error: String::new(),
         spawned: 0,
         thumbing: false,
+        percent: 100.0,
+        testing: None,
         interval_at: None,
         hours_at: None,
     };
@@ -1103,6 +1360,11 @@ async fn main() -> Res<()> {
                     d.refresh_snapshot().await;
                 }
                 Event::ThumbsDone => d.thumbing = false,
+                Event::Percent(p) => d.percent = p,
+                Event::Color(id, color) => d.db.set_color(&id, &color),
+                Event::Tested(id, verdict, frame) => d.on_tested(&id, verdict, frame),
+                Event::TestsDone => d.testing = None,
+                Event::Workshop(reply) => d.on_workshop(&reply),
             },
             Some(()) = hypr_rx.recv() => d.refresh_snapshot().await,
             _ = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now)), if deadline.is_some() => d.on_tick(),

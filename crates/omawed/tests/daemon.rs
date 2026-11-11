@@ -165,6 +165,29 @@ fn apply_pause_resume_stop() {
         std::fs::read_to_string(format!("/proc/{pid}/cmdline")).is_ok_and(|c| c.replace('\0', " ").contains("--volume 40"))
     });
 
+    // The compatibility test runs the renderer on the side and records a verdict.
+    let tested = request(&sock, json!({"cmd": "test", "args": ["111"]}));
+    assert_eq!(tested["data"], 1, "{tested}");
+    wait_for("test verdict", || status()["testing"].is_null());
+    let compat = request(&sock, json!({"cmd": "list", "opts": {"search": "nebula"}}))["data"][0]["compat"].clone();
+    assert!(compat == "ok" || compat == "black", "{compat}");
+
+    // A renderer that dies at once is a "crash" verdict, and the daemon survives reaping it.
+    std::fs::write(root.join("config/omawe/config.toml"), "backend = \"/bin/false\"\nsync_omarchy_bg = false\nnotify = false\n").unwrap();
+    wait_for("backend swap", || request(&sock, json!({"cmd": "config"}))["data"]["config"]["backend"] == "/bin/false");
+    request(&sock, json!({"cmd": "test", "args": ["111"]}));
+    wait_for("crash verdict", || request(&sock, json!({"cmd": "list", "opts": {"search": "nebula"}}))["data"][0]["compat"] == "crash");
+    wait_for("test end", || status()["testing"].is_null());
+    std::fs::write(root.join("config/omawe/config.toml"), format!("backend = \"{}\"\nsync_omarchy_bg = false\nnotify = false\n", backend.display())).unwrap();
+    wait_for("backend back", || request(&sock, json!({"cmd": "config"}))["data"]["config"]["backend"] != "/bin/false");
+    request(&sock, json!({"cmd": "apply", "args": ["111"], "opts": {"monitor": "TEST-1"}}));
+    wait_for("renderer again", || status()["state"] == "running");
+
+    // A workspace assignment is stored apart from the global one and can be removed on its own.
+    request(&sock, json!({"cmd": "apply", "args": ["111"], "opts": {"workspace": "3"}}));
+    assert_eq!(request(&sock, json!({"cmd": "stop", "opts": {"workspace": "3"}}))["ok"], true);
+    assert_eq!(status()["state"], "running");
+
     request(&sock, json!({"cmd": "stop"}));
     let pid = status()["pid"].as_u64();
     wait_for("stop", || status()["state"] == "off" && pid.is_none_or(|p| proc_state(p).is_none()));

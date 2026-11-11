@@ -37,6 +37,38 @@ fn hex((h, s, l): Hsl) -> String {
     format!("#{:02x}{:02x}{:02x}", byte(r), byte(g), byte(b))
 }
 
+fn hsl_of_hex(hex_color: &str) -> Option<Hsl> {
+    let h = hex_color.strip_prefix('#')?;
+    let byte = |i: usize| u8::from_str_radix(h.get(i..i + 2)?, 16).ok();
+    Some(to_hsl((byte(0)?, byte(2)?, byte(4)?)))
+}
+
+/// The most vivid colour of a palette as #rrggbb: what a wallpaper "is" at a glance.
+pub fn vivid(palette: &[(f64, (u8, u8, u8))]) -> Option<String> {
+    let total: f64 = palette.iter().map(|(n, _)| n).sum();
+    let score = |(n, c): &(f64, (u8, u8, u8))| {
+        let (_, s, l) = to_hsl(*c);
+        s * (1.0 - (l - 0.5).abs()) * (n / total).powf(0.3)
+    };
+    let (_, c) = palette.iter().max_by(|a, b| score(a).total_cmp(&score(b)))?;
+    Some(hex(to_hsl(*c)))
+}
+
+/// Whether a wallpaper colour sits with a theme accent: same hue family, or both near grey.
+pub fn matches(wallpaper: &str, accent: &str) -> bool {
+    let (Some(w), Some(a)) = (hsl_of_hex(wallpaper), hsl_of_hex(accent)) else { return false };
+    if a.1 < 0.15 || w.1 < 0.15 {
+        return a.1 < 0.15 && w.1 < 0.15;
+    }
+    ((w.0 - a.0 + 540.0).rem_euclid(360.0) - 180.0).abs() <= 45.0
+}
+
+/// `accent` from a theme's colors.toml.
+pub fn accent(colors_toml: &str) -> Option<String> {
+    let line = colors_toml.lines().find(|l| l.trim_start().starts_with("accent"))?;
+    Some(line.split('"').nth(1)?.to_string())
+}
+
 /// Parse ImageMagick's `-format %c histogram:info:` output into (pixel count, colour).
 pub fn parse_histogram(text: &str) -> Vec<(f64, (u8, u8, u8))> {
     text.lines()
@@ -142,6 +174,12 @@ mod tests {
         assert!(lightness(value(&toml, "background")) - lightness(value(&toml, "foreground")) > 0.6);
         assert!(colors_toml(&[]).is_none());
         assert!(parse_histogram("garbage\n").is_empty());
+        // Colour matching: hue family, wrap-around at red, and grey only with grey.
+        assert!(matches("#7850ff", "#a197d8") && matches("#ff0010", "#ff1000"));
+        assert!(!matches("#00ff00", "#a197d8") && !matches("#808080", "#a197d8") && matches("#808080", "#909090"));
+        assert!(!matches("", "#a197d8"));
+        assert_eq!(accent("mode = \"dark\"\n\naccent = \"#89b4fa\"\n").as_deref(), Some("#89b4fa"));
+        assert_eq!(vivid(&[(10.0, (20, 20, 20)), (1.0, (255, 0, 0))]).as_deref(), Some("#ff0000"));
         // Round trip stays within rounding error.
         assert_eq!(hex(to_hsl((137, 180, 250))), "#89b4fa");
     }

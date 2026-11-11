@@ -331,16 +331,17 @@ Panel {
               Label {
                 anchors { left: parent.left; right: parent.right; bottom: parent.bottom; margins: Style.space(4) }
                 font.pixelSize: Style.font.caption
-                text: (cell.modelData.fav ? "󰓎 " : "") + (cell.modelData.compat === "crash" ? "󰀦 " : "") + cell.modelData.title
+                text: (cell.modelData.fav ? "󰓎 " : "") + (cell.modelData.compat === "crash" || cell.modelData.compat === "black" ? "󰀦 " : "") + (cell.modelData.outdated ? "󰚰 " : "") + cell.modelData.title
               }
             }
 
             MouseArea {
               anchors.fill: parent
-              acceptedButtons: Qt.LeftButton | Qt.RightButton
+              acceptedButtons: Qt.LeftButton | Qt.RightButton | Qt.MiddleButton
               onClicked: function(mouse) {
                 root.cursor = cell.index
-                if (mouse.button === Qt.RightButton) root.toggleFav(cell.modelData)
+                if (mouse.button === Qt.MiddleButton) root.omawe(["open", cell.modelData.id])
+                else if (mouse.button === Qt.RightButton) root.toggleFav(cell.modelData)
                 else root.apply(cell.modelData)
               }
             }

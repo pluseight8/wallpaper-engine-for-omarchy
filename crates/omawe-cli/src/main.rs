@@ -13,7 +13,8 @@ const USAGE: &str = "omawe — Wallpaper Engine для Omarchy
   omawe next | prev | random [--type T] [--tag T] [--fav] [--monitor M]
   omawe pause | resume | toggle
   omawe stop [--monitor M]           убрать живые обои, оставить статичный кадр
-  omawe list [--type scene|video|web|preset] [--tag T] [--rating R] [--search S] [--fav] [--sort recent]
+  omawe list [--type scene|video|web|preset] [--tag T] [--rating R] [--search S] [--fav] [--match-theme]
+             [--sort recent|popular]
   omawe fav <id|название>            добавить в избранное или убрать
   omawe props <id|название> [--monitor M]            свойства обоев и их значения
   omawe prop <id|название> <ключ> [значение]         изменить свойство; без значения — вернуть по умолчанию
@@ -21,12 +22,17 @@ const USAGE: &str = "omawe — Wallpaper Engine для Omarchy
   omawe preset reset <id|название>                   сбросить все свойства
   omawe volume <0-100> | mute                        звук
   omawe set <настройка> <значение> | unset <настройка>   например: set fps_ac 30, set playlist.every 20
+  omawe apply <id|название> --workspace N            свои обои для воркспейса (stop --workspace N — убрать)
+  omawe test [id|название] [--all]                   проверка совместимости (скрыто, под текущими обоями)
+  omawe workshop sync                                подписчики и обновления из Steam (без ключа и логина)
+  omawe open [id|название]                           страница обоев или Workshop в Steam
+  omawe doctor [--fix]                               диагностика установки
   omawe status | watch | rescan | refresh | config
 
   --json                             ответ демона как есть";
 
 /// Flags that never take a value.
-const SWITCHES: [&str; 3] = ["json", "fav", "thumbs"];
+const SWITCHES: [&str; 5] = ["json", "fav", "thumbs", "all", "match-theme"];
 
 fn main() {
     let mut argv = std::env::args().skip(1);
@@ -34,9 +40,10 @@ fn main() {
         Some(c) if !matches!(c.as_str(), "help" | "-h" | "--help") => c,
         _ => return println!("{USAGE}"),
     };
-    if cmd == "pick" {
-        let err = std::process::Command::new("omawe-pick").args(argv).exec();
-        eprintln!("omawe-pick: {err}");
+    if cmd == "pick" || cmd == "doctor" {
+        let script = format!("omawe-{cmd}");
+        let err = std::process::Command::new(&script).args(argv).exec();
+        eprintln!("{script}: {err}");
         exit(1);
     }
 

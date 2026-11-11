@@ -1,7 +1,7 @@
 //! Hyprland IPC: the event socket wakes us up, the command socket answers what changed.
 
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -14,6 +14,8 @@ pub struct Snapshot {
     pub covered: BTreeSet<String>,
     /// A Steam game window is open.
     pub game: bool,
+    /// Visible workspace id per monitor.
+    pub workspaces: BTreeMap<String, i64>,
 }
 
 fn socket(name: &str) -> Option<PathBuf> {
@@ -41,6 +43,7 @@ pub fn snapshot_from(monitors: &Value, clients: &Value, maximized: bool) -> Snap
         monitors: mons.iter().filter_map(name).collect(),
         covered: mons.iter().filter(|m| covers(m["activeWorkspace"]["id"].as_i64().unwrap_or(0))).filter_map(name).collect(),
         game: clients.iter().any(|c| c["class"].as_str().is_some_and(|s| s.starts_with("steam_app_"))),
+        workspaces: mons.iter().filter_map(|m| Some((name(m)?, m["activeWorkspace"]["id"].as_i64()?))).collect(),
     }
 }
 
@@ -83,6 +86,7 @@ mod tests {
         assert_eq!(snapshot_from(&mons, &one, true).covered, set(&["A"]));
         let s = snapshot_from(&mons, &both, true);
         assert!(s.covered == set(&["A", "B"]) && s.game && s.monitors == ["A", "B"]);
+        assert_eq!(s.workspaces["B"], 2);
         // A maximized window only counts when asked to.
         assert_eq!(snapshot_from(&mons, &both, false).covered, set(&["A"]));
         assert!(snapshot_from(&json!([]), &both, true).covered.is_empty());

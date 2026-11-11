@@ -32,12 +32,21 @@ pub struct Wallpaper {
     /// Cached WebP thumbnail, filled in on request.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub thumb: String,
+    /// Workshop numbers from the last `workshop sync`; 0 when never fetched.
+    pub subs: i64,
+    pub favs: i64,
+    /// The Workshop copy is newer than the files on disk.
+    pub outdated: bool,
+    /// Most vivid colour of the preview as #rrggbb, or "".
+    pub color: String,
     pub fav: bool,
     /// "" (untested), "ok", "crash", "unsupported".
     pub compat: String,
 }
 
-const COLS: &str = "id, dir, title, kind, tags, rating, preview, dependency, preset, fav, compat, props";
+const COLS: &str = "w.id, dir, title, kind, tags, rating, preview, dependency, preset, fav, compat, props,
+    COALESCE(x.subs, 0), COALESCE(x.favs, 0), COALESCE(x.updated, 0) > w.mtime, COALESCE(x.color, '')";
+const FROM: &str = "FROM wallpapers w LEFT JOIN extra x ON x.id = w.id";
 
 fn row(r: &Row) -> rusqlite::Result<Wallpaper> {
     let dir: String = r.get(1)?;
@@ -57,6 +66,10 @@ fn row(r: &Row) -> rusqlite::Result<Wallpaper> {
         compat: r.get(10)?,
         props: r.get(11)?,
         thumb: String::new(),
+        subs: r.get(12)?,
+        favs: r.get(13)?,
+        outdated: r.get(14)?,
+        color: r.get(15)?,
     })
 }
 
@@ -74,6 +87,7 @@ impl Db {
              CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS props(wallpaper TEXT, monitor TEXT, key TEXT, value TEXT NOT NULL,
                PRIMARY KEY(wallpaper, monitor, key));
+             CREATE TABLE IF NOT EXISTS extra(id TEXT PRIMARY KEY, subs INTEGER, favs INTEGER, updated INTEGER, color TEXT);
              CREATE TABLE IF NOT EXISTS presets(wallpaper TEXT, name TEXT, props TEXT NOT NULL,
                PRIMARY KEY(wallpaper, name));",
         )
@@ -121,7 +135,7 @@ impl Db {
     }
 
     pub fn get(&self, id: &str) -> Res<Option<Wallpaper>> {
-        self.0.query_row(&format!("SELECT {COLS} FROM wallpapers WHERE id=?1"), [id], row).optional().map_err(e)
+        self.0.query_row(&format!("SELECT {COLS} {FROM} WHERE w.id=?1"), [id], row).optional().map_err(e)
     }
 
     /// Resolve an id, or a title fragment that matches exactly one wallpaper.
@@ -139,7 +153,7 @@ impl Db {
 
     /// Filters: type, tag, rating, search, fav. sort: "title" (default) or "recent".
     pub fn list(&self, f: &Value) -> Res<Vec<Wallpaper>> {
-        let mut sql = format!("SELECT {COLS} FROM wallpapers WHERE 1");
+        let mut sql = format!("SELECT {COLS} {FROM} WHERE 1");
         let mut args: Vec<String> = Vec::new();
         let like = |s: &str| format!("%{}%", s.replace('%', "\\%").replace('_', "\\_"));
         for (key, clause) in [("type", "kind = ?"), ("rating", "rating = ? COLLATE NOCASE")] {
@@ -159,10 +173,10 @@ impl Db {
         if f.get("fav").is_some_and(|v| v != &Value::Bool(false)) {
             sql += " AND fav = 1";
         }
-        sql += if f.get("sort").and_then(Value::as_str) == Some("recent") {
-            " ORDER BY mtime DESC"
-        } else {
-            " ORDER BY title COLLATE NOCASE, id"
+        sql += match f.get("sort").and_then(Value::as_str) {
+            Some("recent") => " ORDER BY mtime DESC",
+            Some("popular") => " ORDER BY COALESCE(x.subs, 0) DESC, title COLLATE NOCASE",
+            _ => " ORDER BY title COLLATE NOCASE, w.id",
         };
         let mut st = self.0.prepare(&sql).map_err(e)?;
         let rows = st.query_map(params_from_iter(args), row).map_err(e)?;
@@ -178,6 +192,18 @@ impl Db {
 
     pub fn set_compat(&self, id: &str, compat: &str) {
         let _ = self.0.execute("UPDATE wallpapers SET compat=?2 WHERE id=?1 AND compat != 'unsupported'", [id, compat]);
+    }
+
+    pub fn set_workshop(&self, id: &str, subs: i64, favs: i64, updated: i64) {
+        let _ = self.0.execute(
+            "INSERT INTO extra(id, subs, favs, updated) VALUES(?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET subs=?2, favs=?3, updated=?4",
+            params![id, subs, favs, updated],
+        );
+    }
+
+    pub fn set_color(&self, id: &str, color: &str) {
+        let _ = self.0.execute("INSERT INTO extra(id, color) VALUES(?1, ?2) ON CONFLICT(id) DO UPDATE SET color=?2", [id, color]);
     }
 
     /// User property values for a wallpaper: those set for every monitor ("*"), then this monitor's on top.
@@ -286,6 +312,14 @@ mod tests {
         assert_eq!(db.presets("1").unwrap(), ["fast"]);
         db.remove_preset("1", "fast").unwrap();
         assert!(db.preset("1", "fast").is_err());
+
+        // Workshop numbers and colours join in without disturbing the index.
+        db.set_workshop("2", 500, 7, 99);
+        db.set_workshop("1", 100, 1, 5);
+        db.set_color("2", "#ff0000");
+        let popular = db.list(&serde_json::json!({"sort": "popular"})).unwrap();
+        assert!(popular[0].id == "2" && popular[0].subs == 500 && popular[0].outdated && popular[0].color == "#ff0000");
+        assert!(!db.get("1").unwrap().unwrap().outdated && db.get("3").unwrap().unwrap().subs == 0);
 
         db.set_state("k", "v");
         assert_eq!(db.state("k").as_deref(), Some("v"));

@@ -17,7 +17,7 @@ systemctl --user daemon-reload
 [[ -x $BIN/omawe-integrate ]] && "$BIN/omawe-integrate" --remove
 rm -f "$HOME/.config/hypr/omawe.lua"
 omarchy plugin remove "$ID" --yes >/dev/null 2>&1 || rm -rf "$HOME/.config/omarchy/plugins/$ID"
-rm -f "$BIN/omawed" "$BIN/omawe" "$BIN/omawe-pick" "$BIN/omawe-integrate"
+rm -f "$BIN/omawed" "$BIN/omawe" "$BIN/omawe-pick" "$BIN/omawe-integrate" "$BIN/omawe-doctor"
 rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/omawe" "${XDG_CACHE_HOME:-$HOME/.cache}/omawe"
 
 # The background was one of our still frames; go back to one the theme ships.

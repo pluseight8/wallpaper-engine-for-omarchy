@@ -11,6 +11,9 @@ pub struct Config {
     pub fps_battery: u32,
     /// On battery: "fps" (lower the cap), "pause" (SIGSTOP), "static" (stop the renderer, keep the still).
     pub battery: String,
+    /// At or below this charge the `low_battery` mode replaces `battery`.
+    pub low_battery_percent: u32,
+    pub low_battery: String,
     /// Pause a monitor's wallpaper while a fullscreen window hides it.
     pub pause_fullscreen: bool,
     /// Treat a maximized window like a fullscreen one.
@@ -45,6 +48,8 @@ pub struct Playlist {
     pub random: bool,
     /// Which wallpapers take part: the same keys as `omawe list` (type, tag, rating, search, fav).
     pub filter: BTreeMap<String, String>,
+    /// Only wallpapers whose colour is close to the current Omarchy theme's accent (ignored with theme_sync).
+    pub match_theme: bool,
     /// Time of day: "HH:MM" = wallpaper id or title, applied from that time on.
     pub hours: BTreeMap<String, String>,
 }
@@ -56,6 +61,8 @@ impl Default for Config {
             fps_ac: 60,
             fps_battery: 30,
             battery: "fps".into(),
+            low_battery_percent: 20,
+            low_battery: "static".into(),
             pause_fullscreen: true,
             pause_maximized: true,
             stop_on_game: true,
