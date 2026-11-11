@@ -1,0 +1,25 @@
+#!/bin/bash
+# Opens Omarchy's own image picker over the wallpaper library and applies the choice.
+# Arguments are `omawe list` filters, e.g. `omawe pick --type video --fav`.
+set -euo pipefail
+
+dir="${XDG_CACHE_HOME:-$HOME/.cache}/omawe/picker"
+rm -rf "$dir"
+mkdir -p "$dir"
+
+# The picker takes a folder of images and labels each by file name, so the
+# library is presented as symlinks named "<title> [<id>]". Nothing is copied.
+omawe list --json "$@" |
+  jq -r '.data[] | select(.compat != "unsupported" and .preview != "") | [.id, .preview, .title] | @tsv' |
+  while IFS=$'\t' read -r id preview title; do
+    [[ -f $preview ]] || continue
+    title=${title//[\/\\]/ }
+    ln -s "$preview" "$dir/${title:0:60} [$id].${preview##*.}"
+  done
+
+current=$(omawe status --json | jq -r '.data.id // empty')
+selected=$(find "$dir" -name "* \[$current\].*" -print -quit)
+
+choice=$(omarchy-menu-images --show-labels --filterable --lazy-thumbnails --print-name \
+  ${selected:+--selected "$selected"} "$dir") || exit 0
+[[ $choice =~ \[([^]]+)\]$ ]] && omawe apply "${BASH_REMATCH[1]}" >/dev/null

@@ -1,0 +1,12 @@
+{
+  "down": "Wallpaper Engine: демон не запущен",
+  "off": "Wallpaper Engine: нажмите, чтобы выбрать обои",
+  "state.running": "играет",
+  "state.paused": "пауза",
+  "state.stopped": "остановлено",
+  "reason.manual": "пауза",
+  "reason.fullscreen": "пауза за полноэкранным окном",
+  "reason.battery": "экономия батареи",
+  "reason.game": "остановлено на время игры",
+  "reason.error": "не удалось запустить"
+}

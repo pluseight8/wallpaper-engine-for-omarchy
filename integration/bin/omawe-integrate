@@ -1,0 +1,51 @@
+#!/bin/bash
+# Wires omawe into Omarchy's user config, or takes it out again with --remove.
+# Idempotent: safe to run after every update. Never touches /usr/share/omarchy.
+set -euo pipefail
+
+MENU="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
+HYPR="$HOME/.config/hypr/hyprland.lua"
+HOOKS="$HOME/.config/omarchy/hooks"
+SHARE="${XDG_DATA_HOME:-$HOME/.local/share}/omawe/integration"
+REQUIRE='require("hypr.omawe") -- omawe key bindings'
+
+# Our block always goes out first, so re-running never duplicates it.
+[[ -f $MENU ]] && sed -i '/omawe-menu-start/,/omawe-menu-end/d' "$MENU"
+[[ -f $HYPR ]] && sed -i '/require("hypr.omawe")/d' "$HYPR"
+
+if [[ ${1:-} == --remove ]]; then
+  rm -f "$HOOKS/theme-set.d/50-omawe" "$HOOKS/post-update.d/50-omawe"
+  exit 0
+fi
+
+# Menu > Style > Wallpaper Engine
+mkdir -p "$(dirname "$MENU")"
+[[ -s $MENU ]] || printf '{\n}\n' >"$MENU"
+if [[ $(tail -n 1 "$MENU") == "}" ]]; then
+  sed -i '$ d' "$MENU"
+  cat >>"$MENU" <<'JSONC'
+// omawe-menu-start
+  "style.omawe": {"icon":"󰸉","label":"Wallpaper Engine","keywords":"live animated wallpaper steam workshop omawe"},
+  "style.omawe.pick": {"icon":"󰸉","label":"Pick wallpaper","action":"omawe pick"},
+  "style.omawe.favourites": {"icon":"󰓎","label":"Favourites","action":"omawe pick --fav"},
+  "style.omawe.next": {"icon":"󰒭","label":"Next","action":"omawe next"},
+  "style.omawe.random": {"icon":"󰒟","label":"Random","action":"omawe random"},
+  "style.omawe.pause": {"icon":"󰏤","label":"Pause / resume","action":"omawe toggle"},
+  "style.omawe.stop": {"icon":"󰓛","label":"Stop (keep still frame)","action":"omawe stop"},
+// omawe-menu-end
+}
+JSONC
+else
+  echo "omawe: $MENU does not end with '}', menu entry skipped" >&2
+fi
+
+# Key bindings: our own file, one require line in the user's hyprland.lua.
+if [[ -f $HYPR ]]; then
+  [[ -f $HOME/.config/hypr/omawe.lua ]] || cp "$SHARE/hypr/omawe.lua" "$HOME/.config/hypr/omawe.lua"
+  printf '%s\n' "$REQUIRE" >>"$HYPR"
+fi
+
+install -Dm755 "$SHARE/hooks/theme-set" "$HOOKS/theme-set.d/50-omawe"
+install -Dm755 "$SHARE/hooks/post-update" "$HOOKS/post-update.d/50-omawe"
+
+systemctl --user is-enabled -q omawed.service 2>/dev/null || systemctl --user enable -q omawed.service || true

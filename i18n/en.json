@@ -1,0 +1,12 @@
+{
+  "down": "Wallpaper Engine: daemon is not running",
+  "off": "Wallpaper Engine: click to pick a wallpaper",
+  "state.running": "playing",
+  "state.paused": "paused",
+  "state.stopped": "stopped",
+  "reason.manual": "paused",
+  "reason.fullscreen": "paused behind a fullscreen window",
+  "reason.battery": "saving battery",
+  "reason.game": "stopped while a game runs",
+  "reason.error": "failed to start"
+}

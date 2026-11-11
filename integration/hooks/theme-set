@@ -1,0 +1,6 @@
+#!/bin/bash
+# A theme change resets Omarchy's background to the theme's own image, which is
+# what shows whenever the live wallpaper is paused out. Put the still frame back.
+command -v omawe >/dev/null || exit 0
+sleep 1 # the shell finishes its background transition first
+omawe refresh >/dev/null 2>&1 || true

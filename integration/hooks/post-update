@@ -1,0 +1,3 @@
+#!/bin/bash
+# After `omarchy update`: re-check the integration points and repair what an update moved.
+command -v omawe-integrate >/dev/null && omawe-integrate || true

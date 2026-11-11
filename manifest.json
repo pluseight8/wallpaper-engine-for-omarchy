@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "org.pluseight.omawe",
+  "name": "omawe — Wallpaper Engine",
+  "version": "0.1.0",
+  "author": "pluseight",
+  "license": "MIT",
+  "description": "Steam Wallpaper Engine wallpapers for Omarchy: library, per-monitor apply, auto-pause on fullscreen, battery and games. Needs the omawed daemon (run install.sh).",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Wallpaper Engine",
+    "description": "Current live wallpaper: click to pick, right click to pause, scroll to switch",
+    "category": "Compositor",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}
