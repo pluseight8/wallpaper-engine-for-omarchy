@@ -17,6 +17,11 @@ command -v cargo >/dev/null || { echo "нужен cargo (пакет rust или 
 
 # The other Wallpaper Engine plugin kills every renderer it finds, ours included.
 if [[ -d $PLUGINS/$OLD ]]; then
+  # Someone else's plugin: never removed without a yes (--yes for unattended runs).
+  if [[ ${1:-} != --yes ]]; then
+    read -r -p "Установлен плагин $OLD, он несовместим с omawe. Удалить его? [y/N] " answer || answer=
+    [[ $answer == [yYдД]* ]] || { echo "Отменено: ничего не изменено." >&2; exit 1; }
+  fi
   say "Удаляю конфликтующий плагин $OLD"
   bash "$PLUGINS/$OLD/uninstall.sh" >/dev/null 2>&1 || true
   omarchy plugin remove "$OLD" --yes >/dev/null 2>&1 || rm -rf "${PLUGINS:?}/$OLD"

@@ -11,6 +11,8 @@ makedepends=('cargo' 'git')
 optdepends=('steam: the Wallpaper Engine library itself')
 provides=('omawe')
 conflicts=('omawe')
+# makepkg's LTO flags turn the bundled SQLite into objects the Rust linker cannot read.
+options=('!lto')
 install=omawe.install
 source=("omawe::git+$url.git")
 sha256sums=('SKIP')

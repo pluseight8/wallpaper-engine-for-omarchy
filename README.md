@@ -35,7 +35,7 @@ git clone https://github.com/pluseight8/wallpaper-engine-for-omarchy && cd wallp
 - ставит user-юнит `omawed.service` и включает его;
 - копирует плагин оболочки в `~/.config/omarchy/plugins/org.pluseight.omawe` и включает виджет в баре;
 - добавляет меню > Style > Wallpaper Engine, бинды (`~/.config/hypr/omawe.lua`), хуки `theme-set` и `post-update`;
-- **удаляет плагин `io.github.dkgamer02ai.wallpaper-engine`**, если он стоит: тот убивает любые процессы рендерера, включая наши.
+- если стоит плагин `io.github.dkgamer02ai.wallpaper-engine`, **спрашивает и после согласия удаляет его** (`--yes` — без вопроса): тот убивает любые процессы рендерера, включая наши.
 
 Файлы Omarchy в `/usr/share/omarchy` не меняются. Удаление: `./uninstall.sh` — возвращает фон темы.
 
