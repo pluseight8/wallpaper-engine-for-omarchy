@@ -937,7 +937,7 @@ impl Daemon {
 
     /// next / prev / random within the (optionally filtered) library.
     fn step(&mut self, cmd: &str, opts: &Value) -> Res<Reply> {
-        let list: Vec<_> = self.listed(opts)?.into_iter().filter(|w| !matches!(w.compat.as_str(), "unsupported" | "crash" | "black")).collect();
+        let list: Vec<_> = self.listed(opts)?.into_iter().filter(|w| !matches!(w.compat.as_str(), "unsupported" | "crash")).collect();
         if list.is_empty() {
             return Err("подходящих обоев нет".into());
         }
